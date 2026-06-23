@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Chroma persistence (Phase 4)
+assistant/memory/memory_db/
+
+# Project-local memory created wherever karl is launched
+.karl_memory/
+
+# Piper voice models (large; downloaded via setup)
+voices/
+
+# Local secrets
+.env
+
+# Google OAuth secrets (Calendar / Gmail tools) — one token per connected account
+credentials.json
+token.json
+token_*.json
+
+# Karl's creator-set identity facts (birthday, birthplace)
+karl_self.json
+
+# Spam-scan log + keep / auto-delete lists + resume checkpoint (hold sender addresses)
+spam_candidates.json
+spam_keep.json
+spam_autodelete.json
+spam_scan_state.json
+
+# Claude Code local config
+.claude/
+
+# Agent-written personal-data artifacts (kept locally, never committed)
+user_info/
+remembered_facts.md

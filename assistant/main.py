@@ -1,0 +1,1184 @@
+"""CLI entry loop — reads user input, runs the agent turn, keeps history.
+
+The assistant reply is appended back to `messages` after each turn — that
+round-trip is the only thing that creates conversational memory.
+"""
+import datetime
+import logging
+import os
+import random
+import re
+import sys
+import time
+
+import approval
+import config
+import history
+import self_facts
+import skills
+from agent import agent_turn
+from health import preflight
+from memory import store
+from memory.extract import extract_facts, has_remember_cue, remembered_content
+from memory.store import recall, save_memory
+
+log = logging.getLogger("assistant.main")
+
+# --- memory orchestration: ask / tell / confirm / retract / restore -----------
+# A deferred offer awaiting the user's "yes": ("save", fact) or ("restore", text).
+_pending = None
+_last_saved: list[str] = []  # facts saved on the previous turn (for "that was a joke")
+
+_MEM_Q = re.compile(r"(?i)\b(?:do you (?:remember|know|recall)|what do you (?:remember|know)|"
+                    r"have i (?:told|mentioned)|did i (?:tell|mention))\b")
+# Memory-retraction triggers. Deliberately does NOT match bare "delete/remove that X"
+# (those are usually code/file requests); memory deletion needs "forget" or an explicit
+# "... the memory/note/fact" / "... from memory".
+_FORGET = re.compile(r"(?i)(?:\bforget(?:ting)?\b"
+                     r"|\bthat(?:'?s| was| is)?\s*(?:a |just a )?(?:joke|not (?:real|true)|fake|made up|a lie)\b"
+                     r"|\bi (?:was )?(?:just )?(?:joking|kidding)\b|\bi made (?:that|it) up\b"
+                     r"|\bnever ?mind\b|\bscratch that\b|\bdisregard (?:that|it)\b"
+                     r"|\b(?:delete|remove|erase) (?:that|the|this|my) ?(?:memory|note|fact)\b"
+                     r"|\b(?:delete|remove|erase)\b[\w\s]{0,30}\bfrom (?:your |my )?memory\b)")
+# Permanent (no-undo) deletion — "permanently delete", "delete forever", etc.
+_PERM = re.compile(r"(?i)\b(?:permanent(?:ly)?|forever|for good|completely)\b[\w\s]{0,20}?"
+                   r"\b(?:delete|remove|erase|wipe|forget)\b"
+                   r"|\b(?:delete|remove|erase|wipe)\b[\w\s]{0,20}?\b(?:permanent(?:ly)?|forever|for good)\b")
+# Words stripped to find the deletion target ("permanently delete my dog from your
+# memory" -> "dog"); whatever remains is matched semantically against stored memories.
+_DEL_STRIP = re.compile(r"(?i)\b(?:please|can you|could you|permanently|forever|for good|completely|"
+                        r"delete|remove|erase|wipe|forget(?:ting)?|disregard|scratch|"
+                        r"now|from|your|my|you|me|i|to|in|"
+                        r"that|this|the|it|was|is|a|an|about|of|fact|note|memory|"
+                        r"joke|joking|lie|kidding|fake|made|up|real|true|just|never|mind)\b")
+_AFFIRM = ("yes", "yeah", "yep", "sure", "ok", "okay", "please", "yes please",
+           "go ahead", "do it", "save it", "remember it", "please do", "of course",
+           "restore it", "bring it back")
+# Bare retractions with no target → drop the last thing saved (vs "delete <X>").
+# Allows leading filler ("actually …", "oh wait …").
+_BARE_RETRACT = re.compile(r"(?i)^\W*(?:(?:actually|ok|okay|wait|no|um|hmm|oh|well|sorry)\b[\s,]*)*"
+                           r"(?:that(?:'?s| was| is)?\s*(?:a |just a )?"
+                           r"(?:joke|not real|not true|fake|made up|a lie)|"
+                           r"i (?:was )?(?:just )?(?:joking|kidding)|i made (?:that|it) up|"
+                           r"never ?mind|scratch that|forget (?:it|that)|"
+                           r"disregard (?:that|it)|delete the last)\W*$")
+
+
+# Appended to save/restore notes so Karl confirms only the one fact, not her whole memory.
+_CONFIRM_BRIEF = "Confirm only that in one short sentence; do NOT list or summarize anything else you remember."
+
+
+# A follow-up that points back at the current conversation ("there", "that place").
+# On these, skip memory recall so an unrelated stored fact can't hijack the topic —
+# the conversation history (which the model sees) resolves the reference.
+_FOLLOWUP_REF = re.compile(
+    r"(?i)("
+    r"\bover there\b|\bin there\b|\bdown there\b|\bup there\b|\bback there\b|"
+    r"\bgo(?:ing)? there\b|\bget(?:ting)? there\b|\bhead(?:ing)? there\b|"
+    r"\beat(?:ing)? there\b|\border(?:ing)? there\b|\bdine? there\b|"
+    r"\bthat place\b|\bthis place\b|\bthat one\b|\bthis one\b|\bthat spot\b|\bthe place\b|"
+    # "put them in a spreadsheet", "save those", "list the results" — acting on prior content
+    r"\b(?:put|save|add|list|sort|organi[sz]e|export|include|write|format|arrange|rank|"
+    r"compile|tabulate|turn|make)\b[^.?!]*?\b(?:them|those|these|the (?:list|results?|ones|"
+    r"rest|names?|items?|options?))\b|"
+    # "...in an excel sheet / spreadsheet / csv / table / file" — a data-export destination
+    r"\b(?:in|into|to|on|as)\b\s+(?:an?|the)?\s*(?:excel|spread ?sheet|sheet|csv|table|"
+    r"file|document|doc)\b"
+    r")")
+
+
+def _is_followup_reference(text: str) -> bool:
+    return bool(_FOLLOWUP_REF.search(text))
+
+
+# A recalled memory about the user's girlfriend (the flowers-for-Ixtlalli reminder, how he
+# describes her, etc.) must NOT be volunteered randomly. The model keeps reciting it off-topic
+# despite the prompt, so enforce it here: such memories are dropped from a turn UNLESS the
+# user is actually asking about a gift for her, says she's upset, or names her / "my girlfriend".
+_RELATIONSHIP_MEM = re.compile(r"(?i)\b(girlfriend|ixtlalli)\b")
+_RELATIONSHIP_OK = re.compile(
+    r"(?i)\b(girlfriend|ixtlalli|gift|present|get her|buy her|surprise her|for her birthday|"
+    r"anniversary|what should i get|what to get her|get for her)\b|"
+    r"\bshe(?:'s| is| was| seems| looks| sounds)?\s*(?:so |really |a bit |kind of )?"
+    r"(?:sad|upset|down|blue|crying|mad|angry|unhappy|stressed|having a (?:bad|rough|hard))\b|"
+    r"\b(cheer her up|make her happy|she had a (?:bad|rough|hard) day)\b")
+
+
+def _filter_relationship_mems(mems: list[dict], user_input: str) -> list[dict]:
+    """Drop girlfriend-related memories unless the turn is actually about her."""
+    if _RELATIONSHIP_OK.search(user_input):
+        return mems
+    return [m for m in mems if not _RELATIONSHIP_MEM.search(m.get("text", ""))]
+
+
+# "what have we been talking about?" — recap the current conversation, not memory.
+_RECAP = re.compile(
+    r"(?i)(what (?:have|did|were) we (?:been )?(?:talk(?:ing|ed)?|discuss(?:ing|ed)?|"
+    r"chat(?:ting|ted)?|cover(?:ing|ed)?)(?: about)?"
+    r"|(?:recap|summar(?:y|ize|ise)|sum up|go over|catch me up on) (?:our|this|the) "
+    r"(?:conversation|chat|discussion|talk|session)"
+    r"|what (?:was|were|is) (?:our|this|the) (?:conversation|chat|discussion|talk) about"
+    r"|remind me what we (?:talked|were talking|chatted|discussed))")
+
+
+def _is_conversation_recap(text: str) -> bool:
+    return bool(_RECAP.search(text))
+
+
+# Identity / origin / "what are you made of" questions get a fixed, accurate answer
+# (qwen otherwise improvises — claims to be a single model, or a person). Detected in
+# code so the answer is consistent every time, not left to the model. Two buckets:
+# CREATOR questions ("who made/built you", "who's your creator") ALWAYS credit Wontaek
+# Shin; the rest are general identity/tech questions whose phrasing varies.
+_CREATOR = re.compile(
+    r"(?i)("
+    r"\bwho\s+(?:made|created|built|design(?:ed)?|wrote|coded|programmed|develop(?:ed)?|"
+    r"invented)\s+you\b"
+    r"|\bwho(?:'?s|\s+is|\s+are)\s+(?:your|the)\s+(?:creator|maker|developer|author|builder|"
+    r"inventor|dev|programmer)s?\b"
+    r"|\bwho\s+do\s+(?:i|we)\s+(?:have\s+to\s+)?thank\s+for\s+(?:you|making\s+you)\b"
+    r")")
+
+_IDENTITY = re.compile(
+    r"(?i)("
+    r"\bwho\s+are\s+you\b(?!\s+(?:meeting|seeing|talking|speaking|calling|visiting|going|"
+    r"bringing|taking|inviting|texting|emailing|gonna|with|to|for))"
+    r"|\bwhat\s+are\s+you\s*\??\s*$"
+    r"|\bwhat(?:'?s|\s+is|\s+are)\s+your?\b[^?]*\b(?:made\s+(?:of|from)|built\s+(?:with|from|on)|"
+    r"tech|technolog\w*|stack|llm|llms|model|models|architecture|composed|running\s+on|"
+    r"powered\s+by|written\s+in|run\s+on)\b"
+    r"|\bwhat\s+(?:kind|type|sort)\s+of\s+(?:ai|a\.?i\.?|model|llm|system|program|software|bot|"
+    r"assistant|thing)\s+(?:are|is)\s+you\b"
+    r"|\bwhat\s+(?:technolog\w*|tech|llm|llms|model|models|stack)\b[^?]*\byou\b"
+    r"|\bhow\s+(?:were|are|was)\s+you\s+(?:made|built|created|designed)\b"
+    r"|\bwhat\s+(?:ai|llm|model)\s+are\s+you\b"
+    r"|\bare\s+you\s+(?:an?\s+)?(?:ai|a\.?i\.?|llm|gpt|chat\s?gpt|claude|gemini|language\s+model)\b"
+    r")")
+
+# General identity/tech answers — varied phrasing; only some credit Wontaek Shin, so he
+# isn't named every single time on a "what are you" question.
+_IDENTITY_ANSWERS = (
+    "I'm primarily Python code that provides the infrastructure and represents agents that "
+    "access a blend of stateless, open-source LLMs — like Gemma, Qwen3, and DeepSeek. The "
+    "tooling around voice, skills, context, conversation, and memory was put together by "
+    "Wontaek Shin.",
+    "At my core I'm Python — infrastructure that wires together agents running on a mix of "
+    "stateless, open-source models like Qwen3, Gemma, and DeepSeek, with layers for voice, "
+    "skills, memory, context, and conversation built around them.",
+    "Mostly Python code. I represent agents that draw on several stateless open-source LLMs "
+    "— Gemma, Qwen3, and DeepSeek — wrapped in tooling for voice, skills, context, "
+    "conversation, and memory.",
+    "Think of me as Python infrastructure in front of a blend of open-source, stateless "
+    "language models — Qwen3, Gemma, DeepSeek. The voice, memory, skills, context, and "
+    "conversation tooling around them is Wontaek Shin's work.",
+    "I'm built mostly in Python — the scaffolding that lets agents tap a blend of stateless, "
+    "open-source LLMs such as Gemma, Qwen3, and DeepSeek, with everything around them — "
+    "voice, skills, context, conversation, memory — layered on top.",
+)
+
+# Creator answers — varied phrasing, but EVERY one names Wontaek Shin as the maker.
+_CREATOR_ANSWERS = (
+    "Wontaek Shin made me — he designed and built me: Python infrastructure wired around a "
+    "blend of stateless, open-source LLMs like Gemma, Qwen3, and DeepSeek, plus the tooling "
+    "for voice, skills, context, conversation, and memory.",
+    "I was created by Wontaek Shin. He put together the Python infrastructure and all the "
+    "surrounding tooling — voice, skills, memory, context, conversation — on top of a mix of "
+    "open-source models like Qwen3, Gemma, and DeepSeek.",
+    "That's Wontaek Shin — he designed and assembled me, from the Python core to the voice, "
+    "skills, memory, and conversation layers, over a blend of stateless open-source LLMs "
+    "such as Gemma, Qwen3, and DeepSeek.",
+)
+
+
+# Origin facts (kept straight between the AI and its human creator — never conflated):
+#   Karl was "born" in Reno, Nevada (where it was built).
+#   Wontaek Shin, the creator, is a separate person, born in Daegu, South Korea.
+_AI_BIRTHPLACE = "Reno, Nevada"
+_CREATOR_BIRTHPLACE = "Daegu, South Korea"
+
+# Age / "when were you born" — Karl has a birthplace (Reno) but no human birth DATE;
+# answer in the first person (the model otherwise flips pronouns or invents a date).
+_AGE = re.compile(
+    r"(?i)("
+    r"\bwhen\s+(?:were|was)\s+you\s+(?:born|made|created|built|written)\b"
+    r"|\bwhat(?:'?s|\s+is)\s+your\s+(?:birthday|birth\s*date|age)\b"
+    r"|\bhow\s+old\s+are\s+you\b"
+    r"|\bdo\s+you\s+have\s+(?:a\s+)?(?:birthday|an\s+age)\b"
+    r")")
+
+_AGE_ANSWERS = (
+    f"I don't have a birth date the way people do, but I was 'born' in {_AI_BIRTHPLACE}, "
+    "where Wontaek Shin built me.",
+    f"No real birthday — I'm software — though you could say I came to life in {_AI_BIRTHPLACE}, "
+    "courtesy of my creator, Wontaek Shin.",
+    f"I wasn't born on a date, but my origin is {_AI_BIRTHPLACE}, where Wontaek Shin put me "
+    "together.",
+)
+
+# "Where were you born / where are you from" → Karl's birthplace (Reno).
+_BIRTHPLACE_YOU = re.compile(
+    r"(?i)("
+    r"\bwhere\s+(?:were|was)\s+you\s+(?:born|made|created|built)\b"
+    r"|\bwhere\s+(?:are|do)\s+you\s+(?:from|come\s+from)\b"
+    r"|\bwhat(?:'?s|\s+is)\s+your\s+(?:hometown|home\s*town|birthplace)\b"
+    r")")
+
+_BIRTHPLACE_YOU_ANSWERS = (
+    f"I was born in {_AI_BIRTHPLACE} — that's where Wontaek Shin built me.",
+    f"{_AI_BIRTHPLACE} is my birthplace; that's where my creator, Wontaek Shin, put me together.",
+    f"I come from {_AI_BIRTHPLACE}, where I was first built.",
+)
+
+# "Where was your creator / Wontaek born / from" → the creator's birthplace (Daegu).
+_CREATOR_ORIGIN = re.compile(
+    r"(?i)("
+    r"\bwhere\s+(?:was|were)\s+(?:your\s+(?:creator|maker|developer|builder)|"
+    r"wontaek(?:\s+shin)?)\s+born\b"
+    r"|\bwhere\s+(?:is|'?s|are)\s+(?:your\s+(?:creator|maker|developer)|wontaek(?:\s+shin)?)\s+"
+    r"(?:from|come\s+from)\b"
+    r"|\bwhat(?:'?s|\s+is)\s+(?:your\s+creator'?s?|wontaek(?:\s+shin)?'?s?)\s+(?:hometown|birthplace)\b"
+    r")")
+
+_CREATOR_ORIGIN_ANSWERS = (
+    f"My creator, Wontaek Shin, was born in {_CREATOR_BIRTHPLACE}.",
+    f"Wontaek Shin — the person who made me — was born in {_CREATOR_BIRTHPLACE}.",
+    f"That's Wontaek Shin; he was born in {_CREATOR_BIRTHPLACE}.",
+)
+
+
+def _identity_answer() -> str:
+    return random.choice(_IDENTITY_ANSWERS)
+
+
+def _creator_answer() -> str:
+    return random.choice(_CREATOR_ANSWERS)
+
+
+def _age_answer() -> str:
+    # A creator-set birthday overrides the "no birth date" default.
+    bday = self_facts.get("birthday")
+    if bday:
+        return random.choice((f"My birthday is {bday}.",
+                              f"I was born on {bday}.",
+                              f"You set my birthday as {bday}."))
+    return random.choice(_AGE_ANSWERS)
+
+
+def _birthplace_answer() -> str:
+    place = self_facts.get("birthplace") or _AI_BIRTHPLACE
+    return random.choice((
+        f"I was born in {place} — that's where Wontaek Shin built me.",
+        f"{place} is my birthplace; that's where my creator, Wontaek Shin, put me together.",
+        f"I come from {place}, where I was first built."))
+
+
+def _creator_origin_answer() -> str:
+    return random.choice(_CREATOR_ORIGIN_ANSWERS)
+
+
+def _is_creator_question(text: str) -> bool:
+    return bool(_CREATOR.search(text or ""))
+
+
+def _is_age_question(text: str) -> bool:
+    return bool(_AGE.search(text or ""))
+
+
+def _is_birthplace_question(text: str) -> bool:
+    return bool(_BIRTHPLACE_YOU.search(text or ""))
+
+
+def _is_creator_origin_question(text: str) -> bool:
+    return bool(_CREATOR_ORIGIN.search(text or ""))
+
+
+def _is_identity_question(text: str) -> bool:
+    text = text or ""
+    return bool(_CREATOR.search(text) or _CREATOR_ORIGIN.search(text)
+                or _BIRTHPLACE_YOU.search(text) or _AGE.search(text) or _IDENTITY.search(text))
+
+
+# The creator TEACHING Karl a fact about ITSELF ("you were born on June 20th, 2026",
+# "your birthday is …"). Captured into the self-facts store (overrides the canned
+# answer) instead of being filed as a fact about the user. Value runs to a sentence
+# end or a trailing "can you remember / forever" tail.
+_VAL = r"(.+?)(?:\s*[.?!]|\s+(?:can you|could you|would you|please|and remember|remember|forever)\b|$)"
+_SELF_FACTS = (
+    ("birthday", re.compile(r"(?i)\byou\s+(?:were|was)\s+born\s+on\s+" + _VAL)),
+    ("birthday", re.compile(r"(?i)\byour\s+birth\s*day\s+(?:is|was|'?s)\s+" + _VAL)),
+    ("birthplace", re.compile(r"(?i)\byou\s+(?:were|was)\s+born\s+in\s+" + _VAL)),
+    ("birthplace", re.compile(r"(?i)\byour\s+(?:birthplace|hometown)\s+(?:is|was|'?s)\s+" + _VAL)),
+)
+
+
+def _capture_self_fact(text: str) -> "tuple[str, str] | None":
+    """If the user is setting one of Karl's own facts, return (key, value)."""
+    for key, rx in _SELF_FACTS:
+        m = rx.search(text or "")
+        if m:
+            val = m.group(1).strip().strip(".,!?").strip()
+            if val:
+                return key, val
+    return None
+
+
+# A short reaction/follow-up to the previous answer ("Really?", "Are you sure?", "Why?").
+# The whole message is the reaction (anchored), so longer questions don't match. These
+# refer to the LAST topic — the model otherwise drifts (e.g. into an identity spiel), so
+# we steer it back to the current subject.
+_REACTION = re.compile(
+    r"(?i)^\s*(?:"
+    r"really|seriously|for real|no way|wait\s*,?\s*what|are you sure|you sure|"
+    r"is that (?:right|true|correct|so)|says who|how come|how do you know|why|"
+    r"oh\s*really|hmm+|huh|what|wow|whoa|that(?:'s| is)\s+(?:surprising|interesting|crazy|wild)"
+    r")[\s,.!?]*$")
+
+
+def _is_short_reaction(text: str) -> bool:
+    return bool(_REACTION.search(text or ""))
+
+
+# A request to REVISE the previous answer ("that's too long", "in one line", "shorter",
+# "rephrase that", "try again"). Like a reaction, it refers to the LAST answer — skip
+# memory recall and keep the model on that output, so it doesn't pull in unrelated facts.
+_REVISE = re.compile(
+    r"(?i)("
+    r"\btoo long\b|\btoo short\b|\btoo wordy\b|\btoo verbose\b|\btoo much text\b|"
+    r"\bin (?:one|a single) (?:line|sentence)\b|\bin a sentence\b|\bone[\s-]?line\b|"
+    r"\bone[\s-]?liner\b|\bsingle line\b|\bone sentence\b|\bjust (?:one|a) (?:line|sentence)\b|"
+    r"\bmake it (?:short|shorter|brief|briefer|concise|simpler|longer|tighter)\b|"
+    r"\bkeep it (?:short|brief|concise)\b|"
+    r"\bshorter\b|\bless wordy\b|\bmore concise\b|\bfewer words\b|\bcut it down\b|"
+    # revision verbs, but NOT when followed by a concrete object ("shorten this video file")
+    r"\b(?:shorten|condense|simplify|tighten|trim|rephrase|reword)\b(?!\s+(?:this|the|a|an|my|these|those|your)\s+\w)|"
+    r"\brewrite (?:that|it|this)\b|\bsay it (?:differently|another way)\b|"
+    r"\btry again\b|\bdo(?:\s+that|\s+it)? again\b|\bredo (?:that|it)\b|"
+    r"\btl;?dr\b|\bexpand (?:on )?(?:that|it)\b|\bmore detail\b|\belaborate\b"
+    r")")
+
+
+def _is_revision_request(text: str) -> bool:
+    return bool(_REVISE.search(text or ""))
+
+
+def _refers_to_previous(text: str) -> bool:
+    """A reaction or a revision request — both point at the last answer, not a new topic."""
+    return _is_short_reaction(text) or _is_revision_request(text)
+
+
+# A request/question, not a personal statement — skip casual fact extraction on these so
+# content like "write a letter that says I love him" isn't saved as a fake preference.
+_REQUEST = re.compile(r"(?i)^\s*(?:can|could|would|will|please|are you|could you|would you|"
+                      r"will you|write|create|make|draft|compose|generate|build|give me|show me|"
+                      r"help me|tell me|find|search|look up|do you|how|what|who|whom|when|where|"
+                      r"why|which|whose|is|are|do|does|did|should)\b|\?\s*$")
+
+
+def _is_request(text: str) -> bool:
+    return bool(_REQUEST.search(text))
+
+
+def _is_memory_question(text: str) -> bool:
+    return bool(_MEM_Q.search(text))
+
+
+def _is_forget(text: str) -> bool:
+    return bool(_FORGET.search(text) or _PERM.search(text))
+
+
+def _is_permanent_delete(text: str) -> bool:
+    return bool(_PERM.search(text))
+
+
+def _is_bare_retract(text: str) -> bool:
+    return bool(_BARE_RETRACT.search(text))
+
+
+def _is_affirm(text: str) -> bool:
+    """A short, clear affirmation — NOT any sentence starting with 'sure'/'go ahead',
+    so an ordinary request can't accidentally confirm a stale memory offer."""
+    t = text.strip().lower().rstrip(".!?")
+    if t in _AFFIRM:
+        return True
+    words = t.split()
+    if not words or len(words) > 5:
+        return False
+    return (words[0] in ("yes", "yeah", "yep", "sure", "ok", "okay")
+            or t.startswith(("go ahead", "please do", "do it", "save it",
+                             "remember it", "restore")))
+
+
+# Scope of a "remember": global (cross-project) vs local (this launch directory).
+_GLOBAL_CUE = re.compile(r"(?i)\b(forever|globally?|everywhere|all projects?|cross.project|"
+                         r"permanently|always)\b")
+_LOCAL_CUE = re.compile(r"(?i)\b(locally|for (?:this|the current) (?:project|directory|repo|folder|context)|"
+                        r"in (?:this|the current) (?:project|directory|repo|folder)|"
+                        r"(?:this|current) (?:project|directory|context)|just (?:here|this)|project memory)\b")
+
+
+def _memory_scope(text: str):
+    """Explicit scope from a 'remember' phrase, or None (ambiguous → ask the user)."""
+    if _LOCAL_CUE.search(text):
+        return "local"
+    if _GLOBAL_CUE.search(text):
+        return "global"
+    return None
+
+
+def _scope_answer(text: str):
+    """Interpret the answer to 'forever or just this project?' — global / local / None."""
+    if re.search(r"(?i)\b(forever|globally?|everywhere|all projects?|permanent\w*|always|cross.project)\b", text):
+        return "global"
+    if re.search(r"(?i)\b(locally?|this (?:project|one|context|directory|repo|folder)|just this|"
+                 r"for this|current|here)\b", text):
+        return "local"
+    return None
+
+
+def _scope_label(scope: str) -> str:
+    return "this project" if scope == "local" else "everywhere"
+
+
+# Trailing scope qualifier to trim from a stored fact ("... just for this project").
+_SCOPE_TAIL = re.compile(
+    r"(?i)[\s,]*(?:just |only )?(?:for|in|across) (?:this|the current|all) "
+    r"(?:projects?|director(?:y|ies)|repos?|folders?|context)\s*\.?$"
+    r"|[\s,]*(?:forever|globally|everywhere|permanently|in all projects)\s*\.?$")
+
+
+def _strip_scope_tail(text: str) -> str:
+    return _SCOPE_TAIL.sub("", text).strip(" ,.")
+
+
+def _save_facts(facts: list[str], scope: str = "global") -> None:
+    global _last_saved
+    saved = []
+    for fact in facts:
+        if save_memory(fact, scope=scope) == "saved":
+            print(f"  · remembered ({_scope_label(scope)}): {fact}")
+            saved.append(fact)
+    if saved:
+        _last_saved = saved
+
+
+def _delete_match(text: str, permanent: bool) -> None:
+    if store.delete_texts([text], hard=permanent):
+        print(f"  · {'permanently deleted' if permanent else 'moved to recently deleted'}: {text}")
+
+
+def _plan_forget(user_input: str, mems: list[dict]) -> str:
+    """Handle a retraction. A bare retraction ('that was a joke') drops the last save
+    immediately; a targeted 'forget X' finds the closest memory and asks to CONFIRM
+    before deleting (because loose targets can match the wrong memory). Returns a note."""
+    global _pending, _last_saved
+    _pending = None
+    permanent = _is_permanent_delete(user_input)
+    if _is_bare_retract(user_input):
+        if _last_saved and store.delete_texts(_last_saved, hard=permanent):
+            d, _last_saved[:] = _last_saved[0], []
+            mems[:] = [m for m in mems if m.get("text") != d]  # don't show it as still-known
+            verb = "permanently deleted" if permanent else "moved to recently deleted"
+            print(f"  · {verb}: {d}")
+            return ('[You just DELETED that note from memory. Tell the user briefly you\'ve '
+                    'removed/forgotten it. Do NOT say you saved or restored it.]')
+        return "[There was nothing recent to remove. Acknowledge briefly.]"
+    target = re.sub(r"\s+", " ", _DEL_STRIP.sub(" ", user_input)).strip(" ,.!?")
+    hits = store.recall(target, k=1) if target else []
+    if hits:
+        _pending = ("delete", hits[0]["text"], permanent)
+        verb = "permanently delete" if permanent else "forget"
+        return (f"[If the user means to {verb} a stored MEMORY (not delete code or files), the "
+                f'closest memory is: "{hits[0]["text"]}". Confirm they mean THAT memory before '
+                "removing it. If they mean code or files, just do that task and ignore this.]")
+    return ("[No matching stored memory was found. If they meant a memory, say you don't have "
+            "one about that; if they meant code or files, just do the task.]")
+
+
+def _handle_memory(user_input: str, mems: list[dict]) -> str:
+    """Process this turn's memory intent BEFORE the reply (so what Karl says is true),
+    and return a note to fold into the user turn telling her what just happened / to ask."""
+    global _pending, _last_saved
+
+    # Answer to a pending "forever or this project?" scope question.
+    if _pending and _pending[0] == "scope":
+        scope = _scope_answer(user_input)
+        if scope:
+            fact = _pending[1]
+            _pending = None
+            _save_facts([fact], scope=scope)
+            return f'[You just saved that to {_scope_label(scope)} memory. {_CONFIRM_BRIEF}]'
+        _pending = None
+        if _is_forget(user_input) or _is_bare_retract(user_input):
+            # "never mind" / "forget it" cancels the question — save nothing, delete nothing.
+            return "[The user cancelled the request to remember that. Acknowledge briefly; nothing was saved.]"
+        # otherwise fall through and treat as a fresh turn
+
+    # Confirm a pending offer ("yes") — save / restore / delete.
+    if _pending and _is_affirm(user_input):
+        p = _pending
+        _pending = None
+        kind = p[0]
+        if kind == "restore" and store.restore(p[1]):
+            _last_saved = [p[1]]
+            print(f"  · restored: {p[1]}")
+            return f'[You just restored this note: "{p[1]}". {_CONFIRM_BRIEF}]'
+        if kind == "save":
+            _save_facts([p[1]])  # default global
+            return f'[You just saved this: "{p[1]}". {_CONFIRM_BRIEF}]'
+        if kind == "delete":
+            _delete_match(p[1], p[2])
+            mems[:] = [m for m in mems if m.get("text") != p[1]]  # don't show it as still-known
+            verb = "permanently deleted" if p[2] else "removed"
+            return (f'[You just {verb} that memory. Tell the user briefly it\'s {verb}. '
+                    'Do NOT say you saved or restored it.]')
+        return ""
+
+    # Asking whether she remembers something (checked before forget so "do you remember
+    # to delete X?" is answered, not executed).
+    if _is_memory_question(user_input):
+        if not mems:
+            try:
+                hits = store.recall_deleted(user_input)
+            except Exception:  # noqa: BLE001
+                hits = []
+            if hits:
+                _pending = ("restore", hits[0]["text"])
+                return ("[This is NOT in active memory, but the user previously deleted a related "
+                        f'note: "{hits[0]["text"]}". Tell them you don\'t have it actively but they '
+                        "deleted it, and offer to restore it — do not state it as a current fact.]")
+        cand = remembered_content(user_input)
+        _pending = ("save", cand[0]) if cand else None
+        return ""
+
+    # Retraction / deletion (bare → immediate; targeted → confirm first).
+    if _is_forget(user_input):
+        return _plan_forget(user_input, mems)
+
+    # Explicit "remember X" command.
+    if has_remember_cue(user_input):
+        facts = remembered_content(user_input)
+        _pending = None
+        if not facts:
+            return ""
+        scope = _memory_scope(user_input)
+        if scope is None:  # ambiguous → ask which scope (ONE short question), save nothing yet
+            _pending = ("scope", facts[0])
+            return ('[Ask ONE short scope question and save nothing yet — exactly like: '
+                    '"Got it — forever, or just for this project?" Keep it that short; '
+                    "don't explain scopes or claim it's saved.]")
+        _save_facts([_strip_scope_tail(f) for f in facts], scope=scope)
+        return f"[You just saved that to {_scope_label(scope)} memory. {_CONFIRM_BRIEF}]"
+
+    # Casual implicit self-fact → save globally, silently — but NOT from a request or
+    # question (so "write a letter that says I love him" isn't saved as a preference).
+    _pending = None
+    if not _is_request(user_input):
+        _save_facts(extract_facts(user_input), scope="global")
+    return ""
+
+
+def _memory_preface(mems: list[dict]) -> str:
+    """Render recalled memories as a context block prepended to the user's turn.
+
+    Folded into the user message (not a separate system message) because local
+    models reliably attend to the user turn but often ignore a secondary system
+    block.
+    """
+    lines = []
+    for m in mems:
+        try:
+            date = datetime.date.fromtimestamp(m["ts"]).isoformat()
+            lines.append(f"- ({date}) {m['text']}")
+        except Exception:  # noqa: BLE001
+            lines.append(f"- {m['text']}")
+    return (
+        "[Background you already know about me (treat as true; prefer the most recent date "
+        "if any conflict). Use an item ONLY if it directly answers my CURRENT message. Do "
+        "NOT list or recite these back, and do NOT tack reminders, to-dos, suggestions, or "
+        "personal details onto a reply about something else — answer only what I asked and "
+        "stay on topic. This is NOT data I just gave you, so never write it into a file, "
+        "spreadsheet, or document — if I ask you to save or export 'them'/'those'/'the "
+        "results', that refers to what we were just discussing in the conversation, not this "
+        "background:\n" + "\n".join(lines) + "]"
+    )
+
+
+# Phrases that mean the model deflected to its training instead of searching.
+_DEFLECT = re.compile(
+    r"(?i)(knowledge cutoff|training (?:data|cutoff)|as of my last|"
+    r"don'?t have (?:access to |the )?(?:the )?(?:most )?(?:up.?to.?date|current|real.?time|latest)|"
+    r"can'?t provide the most current|may be outdated|might be out ?of ?date|"
+    r"check (?:their|the)? ?(?:current|latest|recent) (?:website|reviews?|menu|info|information|prices?)|"
+    r"i'?d (?:suggest|recommend) (?:checking|looking)|"
+    r"(?:i'?m |i am )?not familiar with|never heard of|"
+    r"(?:i'?m |i am )?not aware of (?:any|a|an|the)|"
+    r"don'?t have (?:any )?information (?:on|about)|"
+    r"(?:un)?able to find any information|"
+    # deflecting to the injected memory instead of searching the web
+    r"based on the (?:background|provided|available)\b|"
+    r"in (?:the |my |your )?(?:provided |given )?background\b|"
+    r"(?:provided |background )(?:notes?|information|details?|knowledge)\b|"
+    r"(?:do(?:es)?n'?t|don'?t|do not|does not|isn'?t|is not) (?:contain|include|have|mention)\b[^.?!]*\b(?:background|information)|"
+    r"(?:i )?would need to (?:search|look|find|check|consult)|"
+    r"i can(?:'?t|not) provide (?:details?|information|specifics?)\b)")
+
+
+def _is_deflection(text: str) -> bool:
+    return bool(_DEFLECT.search(text or ""))
+
+
+def _used_web_search(messages: list[dict], since: int) -> bool:
+    """True if a web_search tool call appears in the messages added this turn."""
+    for m in messages[since:]:
+        for tc in (m.get("tool_calls") or []):
+            if (tc.get("function") or {}).get("name") == "web_search":
+                return True
+    return False
+
+
+def _force_search_answer(messages: list[dict], user_input: str, printer: "_Printer | None") -> "str | None":
+    """The model deflected without searching — search now and re-answer from results."""
+    from tools.search import web_search
+    try:
+        results = web_search(user_input)
+    except Exception as e:  # noqa: BLE001
+        log.debug("forced web_search failed: %s", e)
+        return None
+    if not results or results.startswith("ERROR"):
+        return None
+    if messages and messages[-1].get("role") == "assistant":
+        messages.pop()                                  # drop the deflecting reply
+    messages.append({"role": "user", "content":
+        "Answer my previous question using ONLY these current web results. Cite them "
+        "[1], [2]. Do NOT search again, mention any knowledge cutoff, or tell me to check "
+        "elsewhere:\n" + results})
+    print("\n  ↻ that was dated — checking the web…")
+    p2 = _Printer(printer.label) if printer else None
+    try:
+        reply = agent_turn(messages, on_token=p2.write if p2 else None)
+        if p2:
+            if not p2.started and reply:
+                p2.write(reply)
+            p2.finish()
+        return reply
+    except Exception as e:  # noqa: BLE001
+        log.debug("re-answer failed: %s", e)
+        return None
+
+
+def _approve_command(command: str) -> tuple[bool, str]:
+    """Interactive approval prompt for run_command (installed only in 'prompt' mode)."""
+    prefix = approval.command_prefix(command)
+    print(f"\n  ⚠  the agent wants to run a shell command:\n      {command}")
+    opts = ["[y] yes, once"]
+    if prefix:
+        opts.append(f"[p] yes, and don't ask again for '{prefix}' commands")
+    opts += ["[a] yes, all commands this session", "[n] no"]
+    try:
+        ans = input("  " + "   ".join(opts) + "\n  > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False, "no input — declined"
+    if ans in {"a", "all", "always"}:
+        approval.approve_session()
+        return True, "approved (all commands this session)"
+    if prefix and ans in {"p", "prefix"}:
+        approval.allow_prefix(prefix)
+        return True, f"approved (all '{prefix}' commands this session)"
+    if ans in {"y", "yes"}:
+        return True, "approved by user"
+    return False, "declined by user"
+
+
+def _approve_command_voice(command: str) -> tuple[bool, str]:
+    """Spoken approval for run_command during a hands-free voice session: Karl reads
+    the request and you answer out loud (yes / no / always)."""
+    import voice
+    print(f"\n  ⚠  the agent wants to run a shell command:\n      {command}")
+    spoken = command if len(command) <= 80 else "a shell command, shown on your screen"
+    voice.speak_interruptible(f"I'd like to run {spoken}. Should I? Say yes, no, or always.")
+    for _ in range(2):
+        print("  🎤 (say yes / no / always)…", end="\r", flush=True)
+        try:
+            ans = (voice.listen_vad(start_timeout=15) or "").lower()
+        except (KeyboardInterrupt, EOFError):
+            return False, "cancelled"
+        print(" " * 34, end="\r", flush=True)
+        if not ans:
+            voice.speak_interruptible("I didn't catch that.")
+            continue
+        if re.search(r"\b(always|every ?time|all (?:commands|of them)|go ahead with everything)\b", ans):
+            approval.approve_session()
+            return True, "approved (all commands this session)"
+        if re.search(r"\b(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|please do|approve|sounds good)\b", ans):
+            return True, "approved by voice"
+        if re.search(r"\b(no|nope|nah|don'?t|do not|deny|stop|cancel|skip)\b", ans):
+            return False, "declined by voice"
+        voice.speak_interruptible("Was that a yes or a no?")
+    return False, "no clear answer — declined"
+
+
+def _confirm_action(prompt: str, allow_always: bool = True) -> bool:
+    """Text confirmation for an outward action. When allow_always is False the
+    'yes to all' option is withheld, so the action is confirmed every time."""
+    print(f"\n  ⚠  {prompt}")
+    opts = "  [y] yes   [n] no" + ("   [a] yes to all this session" if allow_always else "")
+    try:
+        ans = input(opts + "\n  > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if allow_always and ans in {"a", "all", "always"}:
+        approval.confirm_auto()
+        return True
+    return ans in {"y", "yes"}
+
+
+def _confirm_action_voice(prompt: str, allow_always: bool = True) -> bool:
+    """Spoken confirmation for an outward action. With allow_always False, 'always'
+    is not offered or honored — the action is confirmed every time."""
+    import voice
+    print(f"\n  ⚠  {prompt}")
+    tail = "Say yes, no, or always." if allow_always else "Say yes or no."
+    voice.speak_interruptible(f"{prompt} {tail}")
+    for _ in range(2):
+        print("  🎤 (say yes / no" + (" / always" if allow_always else "") + ")…", end="\r", flush=True)
+        try:
+            ans = (voice.listen_vad(start_timeout=15) or "").lower()
+        except (KeyboardInterrupt, EOFError):
+            return False
+        print(" " * 34, end="\r", flush=True)
+        if not ans:
+            voice.speak_interruptible("I didn't catch that.")
+            continue
+        if allow_always and re.search(r"\b(always|every ?time|go ahead with everything|yes to all)\b", ans):
+            approval.confirm_auto()
+            return True
+        if re.search(r"\b(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|please do|approve|sounds good)\b", ans):
+            return True
+        if re.search(r"\b(no|nope|nah|don'?t|do not|deny|stop|cancel|skip)\b", ans):
+            return False
+        voice.speak_interruptible("Was that a yes or a no?")
+    return False
+
+
+def _setup_logging() -> None:
+    level = logging.DEBUG if os.environ.get("ASSISTANT_DEBUG") else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+
+
+def _system_message() -> dict:
+    today = datetime.date.today().isoformat()
+    return {"role": "system",
+            "content": config.SYSTEM_PROMPT.format(name=config.AGENT_NAME, date=today)}
+
+
+class _Printer:
+    """Streams the assistant's reply to the terminal, printing the label prefix
+    lazily on the first token (so tool-resolution steps stay silent)."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.started = False
+
+    def write(self, text: str) -> None:
+        if not self.started:
+            print(f"{self.label} ▸ ", end="", flush=True)
+            self.started = True
+        print(text, end="", flush=True)
+
+    def finish(self) -> None:
+        if self.started:
+            print()
+
+
+def process_turn(messages: list[dict], user_input: str, printer: "_Printer | None" = None) -> str | None:
+    """Run one full turn: recall memories, run the agent (streaming the final
+    answer to `printer` if given), persist new facts.
+
+    Shared by the text and voice loops. Returns the assistant reply, or None if
+    the turn errored (already reported). Mutates `messages` (history) in place.
+    """
+    base_len = len(messages)  # index of this turn's user message / rollback point
+
+    # The creator setting one of Karl's OWN facts ("you were born on …") → store it as a
+    # self-fact (overrides the canned answer) instead of filing it as a fact about the
+    # user. Persisted, so it survives across sessions.
+    _self = _capture_self_fact(user_input)
+    if _self:
+        key, val = _self
+        self_facts.set_fact(key, val)
+        answer = f"Got it — I'll remember my {key} is {val}."
+        messages.append({"role": "user", "content": user_input})
+        messages.append({"role": "assistant", "content": answer})
+        history.trim(messages)
+        if printer:
+            printer.write(answer)
+            printer.finish()
+        return answer
+
+    # Identity / origin / "what are you made of" → answer from the fixed description, not
+    # the model (which improvises). Recorded in history so follow-ups have context.
+    if _is_identity_question(user_input):
+        # Keep the AI and its creator distinct. Check creator-origin BEFORE the AI's own
+        # birthplace so "where was your creator born?" → Daegu, not Reno.
+        if _is_creator_origin_question(user_input):
+            answer = _creator_origin_answer()          # Wontaek → Daegu, South Korea
+        elif _is_creator_question(user_input):
+            answer = _creator_answer()                 # "who made you?" → Wontaek Shin
+        elif _is_birthplace_question(user_input):
+            answer = _birthplace_answer()              # "where were you born?" → Reno
+        elif _is_age_question(user_input):
+            answer = _age_answer()                     # "when were you born?" → no date
+        else:
+            answer = _identity_answer()                # "what are you?" → varied tech
+        messages.append({"role": "user", "content": user_input})
+        messages.append({"role": "assistant", "content": answer})
+        history.trim(messages)
+        if printer:
+            printer.write(answer)
+            printer.finish()
+        return answer
+
+    # Recall memories (both scopes) for context — but NOT on a follow-up that refers to
+    # the current conversation ("what's good there?") or a recap request ("what have we
+    # been talking about?"), so a stray memory can't hijack or pollute the answer.
+    if (_is_followup_reference(user_input) or _is_conversation_recap(user_input)
+            or _refers_to_previous(user_input)):
+        mems = []
+    else:
+        try:
+            mems = recall(user_input)
+        except Exception as e:  # noqa: BLE001 — memory must never break chatting
+            log.debug("recall failed: %s", e)
+            mems = []
+        # Never volunteer girlfriend/Ixtlalli memories unless the turn is about her.
+        mems = _filter_relationship_mems(mems, user_input)
+
+    # Process this turn's memory intent BEFORE replying (save/delete/restore/ask), so
+    # whatever Karl says about memory is accurate. Returns a note to inject for her.
+    try:
+        note = _handle_memory(user_input, mems)
+    except Exception as e:  # noqa: BLE001 — memory must never break chatting
+        log.debug("memory handling failed: %s", e)
+        note = ""
+
+    # Match skill playbooks for this turn (markdown instructions folded in like memory).
+    try:
+        skill_block = skills.skills_preface(skills.match_skills(user_input))
+    except Exception as e:  # noqa: BLE001 — skills must never break chatting
+        log.debug("skill matching failed: %s", e)
+        skill_block = ""
+
+    # A reaction ("Really?", "Why?") or a revision request ("too long", "in one line",
+    # "rephrase that") refers to the LAST answer — steer the model to revise/respond to
+    # THAT, instead of drifting onto an unrelated memory or an identity spiel.
+    reaction_steer = ""
+    if _refers_to_previous(user_input) and any(
+            m.get("role") == "assistant" for m in messages[:base_len]):
+        reaction_steer = (
+            "[This refers to your PREVIOUS answer — revise or respond to THAT exact output "
+            "(e.g. shorten/rephrase/justify it, or answer the reaction). Stay on the same "
+            "topic; do NOT switch subjects, introduce unrelated facts, or start talking "
+            "about yourself or who made you.]")
+
+    # Fold context into the user turn (transiently — restored to clean after).
+    preface = _memory_preface(mems) if mems else ""
+    if note:
+        preface += ("\n" if preface else "") + note
+    if skill_block:
+        preface += ("\n" if preface else "") + skill_block
+    if reaction_steer:
+        preface += ("\n" if preface else "") + reaction_steer
+    messages.append({"role": "user", "content": user_input})
+    if preface:
+        messages[base_len]["content"] = preface + "\n\n" + user_input
+
+    try:
+        reply = agent_turn(messages, on_token=printer.write if printer else None)
+    except Exception as e:  # noqa: BLE001 — keep the loop alive on transient errors
+        if printer:
+            printer.finish()
+        print(f"[error during turn: {e}]")
+        del messages[base_len:]  # roll back the whole turn so history stays consistent
+        return None
+
+    if preface:
+        messages[base_len]["content"] = user_input  # restore the clean user message
+    history.trim(messages)
+
+    if printer:
+        if not printer.started and reply:
+            printer.write(reply)  # nothing streamed (e.g. MAX_STEPS fallback) — show it
+        printer.finish()
+
+    # Tripwire: if she deflected to her training ("knowledge cutoff", "check current
+    # reviews") without searching, search now and re-answer from current results.
+    if reply and _is_deflection(reply) and not _used_web_search(messages, base_len):
+        corrected = _force_search_answer(messages, user_input, printer)
+        if corrected:
+            reply = corrected
+
+    return reply
+
+
+def _text_loop(messages: list[dict], label: str) -> None:
+    while True:
+        try:
+            user_input = input("you ▸ ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nbye.")
+            break
+        if not user_input:
+            continue
+        if user_input.lower() in {"exit", "quit"}:
+            print("bye.")
+            break
+        process_turn(messages, user_input, printer=_Printer(label))
+
+
+def _matches(text: str, options) -> bool:
+    t = text.strip().lower().rstrip(".!?")
+    return t in options or t.startswith(options)
+
+
+def _voice_summary(full_reply: str) -> str:
+    """Rewrite a long reply into a ~30-second spoken summary (no code/markdown).
+    Falls back to a word-truncation if the model call fails."""
+    from llm import chat
+    instr = ("Summarize the assistant reply below for the SPOKEN word in about 75 "
+             "words (~30 seconds), and never more than that. Start straight with the "
+             "content — no preamble like 'here's a summary'. Write in ENGLISH only "
+             "(romanize any foreign names/dishes; no Chinese/Japanese/Korean characters). "
+             "Conversational plain sentences, NO code, NO markdown, NO lists — just the key takeaways.")
+    try:
+        resp = chat([
+            {"role": "system", "content": "You rewrite text to be spoken aloud by a TTS voice."},
+            {"role": "user", "content": instr + "\n\n---\n" + full_reply},
+        ], temperature=0, model=config.VOICE_SUMMARY_MODEL,  # main model is already hot
+           timeout=config.VOICE_SUMMARY_TIMEOUT)              # never let it hang the voice turn
+        summary = (resp.choices[0].message.content or "").strip()
+        if summary:
+            return summary
+        raise ValueError("empty summary")
+    except Exception as e:  # noqa: BLE001 — timeout / stall / empty → speak a truncation
+        log.debug("voice summary failed (%s) — falling back to truncation", e)
+        words = full_reply.split()
+        return " ".join(words[:75]) + ("…" if len(words) > 75 else "")
+
+
+def _get_voice_input(voice, hands_free: bool) -> str:
+    """Capture one utterance — hands-free (VAD) or push-to-talk."""
+    if hands_free:
+        print("🎤 listening…", end="\r", flush=True)
+        text = voice.listen_vad()
+        print(" " * 20, end="\r", flush=True)
+        return text
+    cmd = input("🎤 [Enter]=talk, 't'=type : ").strip().lower()
+    if cmd == "t":
+        return input("you ▸ ").strip()
+    return voice.listen()
+
+
+# Quick spoken acknowledgements so the user hears something the instant she stops
+# talking, instead of dead air while Karl thinks / searches the web.
+_THINKING_FILLERS = (
+    "Got it, let me think about that.",
+    "Hold on a sec while I look into that.",
+    "Good question — let me see.",
+    "Let me look that up real quick.",
+    "One sec, let me check on that.",
+    "Sure, give me a moment.",
+    "Okay, let me dig into that.",
+)
+
+
+def _should_rearm(user_input: "str | None", idle_seconds: float, timeout: float) -> bool:
+    """In an active hands-free conversation, decide whether to re-arm the wake word.
+
+    Re-arm when no speech started this listen (`None`), OR a stretch of empty/noise
+    blips has gone `timeout` seconds without any real utterance. A non-empty utterance
+    keeps the conversation open (and resets the idle clock in the loop)."""
+    if user_input is None:
+        return True
+    if not user_input:                       # empty/noise blip — re-arm only once idle
+        return idle_seconds >= timeout
+    return False                             # real speech — stay active
+
+
+def _voice_loop(messages: list[dict], label: str) -> None:
+    import voice
+    hands_free = config.VOICE_HANDS_FREE
+    timeout = config.VOICE_FOLLOWUP_TIMEOUT
+    barge = config.VOICE_INTERRUPT == "voice"
+    cut = "just start talking to interrupt her (headphone mode)" if barge \
+        else "tap a key to interrupt her (speaker mode)"
+    if hands_free:
+        print("Hands-free voice mode — say \"hey Karl\" to start, then just keep talking.")
+        print(f"After ~{timeout}s of silence she waits for \"hey Karl\" again. "
+              f"{cut[0].upper() + cut[1:]}; \"hey Karl, goodbye\" or Ctrl-C to quit.\n")
+    else:
+        print("Push-to-talk: Enter to start/stop talking ('t' to type). Ctrl-C to quit.\n")
+
+    active = False  # in an ongoing hands-free conversation (no wake word needed)
+    last_active = 0.0  # monotonic time real speech last happened — the idle re-arm clock
+    while True:
+        try:
+            if not hands_free:
+                user_input = _get_voice_input(voice, hands_free)
+            elif active:
+                print("🎤 …", end="\r", flush=True)
+                user_input = voice.listen_vad(start_timeout=timeout)
+                print(" " * 24, end="\r", flush=True)
+                # Re-arm once `timeout` seconds pass with no REAL input — whether that's
+                # clean silence (None) or a run of noise blips that keep re-triggering VAD
+                # (whose per-call timer would otherwise reset every time and never fire).
+                if _should_rearm(user_input, time.monotonic() - last_active, timeout):
+                    active = False
+                    print('  (paused — say "hey Karl" to continue)')
+                    continue
+            else:
+                print('🎤 say "hey Karl"…', end="\r", flush=True)
+                user_input = voice.listen_vad()
+                print(" " * 24, end="\r", flush=True)
+        except (EOFError, KeyboardInterrupt):
+            print("\nbye.")
+            break
+        if not user_input:
+            continue
+        last_active = time.monotonic()  # real, non-empty speech — reset the idle clock
+
+        # Wake word (hands-free): required to start; optional once the conversation is active.
+        if hands_free:
+            cmd = voice.strip_wake_word(user_input)
+            if cmd is not None:               # addressed with "hey Karl"
+                active = True
+                if not cmd:                   # just "hey Karl" with nothing after
+                    voice.speak_interruptible("Yes?")
+                    continue
+                user_input = cmd
+            elif not active:                  # no wake word and not in a conversation → ignore
+                log.debug("ignored (no wake word): %r", user_input)
+                continue
+            # else: active conversation, no wake word needed — use as-is
+
+        print(f"you ▸ {user_input}")
+        if _matches(user_input, ("exit", "quit", "stop", "goodbye", "goodbye karl", "bye")):
+            print("bye.")
+            break
+
+        # Immediate acknowledgement so she doesn't sit in silence while thinking/searching.
+        voice.speak_interruptible(random.choice(_THINKING_FILLERS))
+
+        reply = process_turn(messages, user_input, printer=_Printer(label))
+        if not reply:
+            continue
+
+        # Hard 30-second cap on every spoken response.
+        if voice.estimate_seconds(reply) <= config.VOICE_SUMMARY_THRESHOLD_S:
+            spoken = reply
+        else:
+            print("  (long answer — full text above; speaking a ~30s summary)")
+            spoken = _voice_summary(reply)
+        interrupted = voice.speak_interruptible(spoken)
+
+        if interrupted and messages and messages[-1].get("role") == "assistant":
+            # Tell the model it was cut off so it adapts to what the user says next.
+            messages[-1]["content"] = (messages[-1].get("content") or "") + \
+                " … (interrupted by the user before finishing)"
+            print("  ⏹ interrupted — go ahead")
+
+        # Start the idle re-arm clock when SHE stops talking, so you get the full
+        # follow-up window to respond before "hey Karl" is needed again.
+        last_active = time.monotonic()
+
+
+def main() -> None:
+    _setup_logging()
+    use_voice = (any(f in sys.argv for f in ("--voice", "--headphone", "--speaker"))
+                 or os.environ.get("VOICE", "").lower() in {"1", "true", "yes"})
+    # --headphone: interrupt Karl by talking (barge-in). --speaker: interrupt by key
+    # (safe when the mic can hear Karl's own voice). Either implies voice mode.
+    if "--headphone" in sys.argv:
+        config.VOICE_INTERRUPT = "voice"
+    elif "--speaker" in sys.argv:
+        config.VOICE_INTERRUPT = "key"
+
+    preflight([config.CHAT_MODEL, config.EMBED_MODEL])  # memory needs the embed model too
+    try:
+        store.purge_old_deleted()  # auto-empty trash older than TRASH_TTL_DAYS
+    except Exception as e:  # noqa: BLE001
+        log.debug("trash purge failed: %s", e)
+
+    if config.COMMAND_APPROVAL == "prompt":
+        approval.set_approver(_approve_command_voice if use_voice else _approve_command)
+    # Outward actions (e.g. calendar writes) confirm through the same in/out channel.
+    approval.set_confirmer(_confirm_action_voice if use_voice else _confirm_action)
+
+    name = config.AGENT_NAME
+    label = name.lower()  # prompt label, e.g. "karl ▸"
+
+    messages: list[dict] = [_system_message()]
+    print(f"{name} — local coding agent (model: {config.CHAT_MODEL})")
+    extra = f"fast: {config.FAST_MODEL}"
+    if config.REASONING_ENABLED:
+        extra += f"  ·  reasoning: {config.REASONING_MODEL}"
+    print(f"Subagents — {extra}")
+    print(f"Workspace: {config.WORKSPACE_ROOT}")
+    print(f"Shell approval: {config.COMMAND_APPROVAL}")
+    if use_voice:
+        mode = f"voice ({'headphone — talk to interrupt' if config.VOICE_INTERRUPT == 'voice' else 'speaker — key to interrupt'})"
+    else:
+        mode = "text"
+    print(f"Mode: {mode}. Set ASSISTANT_DEBUG=1 to see tool calls.\n")
+
+    # Periodic background spam scan (read-only; logs candidates every
+    # SPAM_SCAN_INTERVAL). Surface any pending ones so the user can ask for a cleanup.
+    _google_ready = False
+    if config.GMAIL_ENABLED:
+        try:
+            from tools import google_auth
+            _google_ready = bool(google_auth.available_accounts())
+        except Exception as e:  # noqa: BLE001
+            log.debug("google account check failed: %s", e)
+    # Only run the spam scanner once a Google account is actually connected — otherwise a
+    # carried-over auto-delete list would (mis)report and the scanner would hit auth errors.
+    if _google_ready and config.SPAM_SCAN_ENABLED:
+        import spam
+        # Batch-progress updates print, and speak too in voice mode.
+        def _announce(msg: str) -> None:
+            print(f"  📬 {msg}")
+            if use_voice:
+                try:
+                    import voice
+                    voice.speak(msg)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("spoken progress failed: %s", e)
+        spam.set_announcer(_announce)
+        spam.start_background_scanner()
+        try:
+            blocked = spam.load_autodelete()
+            if blocked:
+                print(f"🗑  auto-deleting unread from {len(blocked)} confirmed sender(s) "
+                      "in the background.")
+            pending = spam.load_candidates()
+            if pending:
+                print(f"📬 {len(pending)} sender(s) have over {config.SPAM_UNREAD_THRESHOLD} "
+                      "unread emails — say \"spam cleanup\" to review.")
+            if blocked or pending:
+                print()
+        except Exception as e:  # noqa: BLE001
+            log.debug("spam notice failed: %s", e)
+
+    if use_voice:
+        _voice_loop(messages, label)
+    else:
+        _text_loop(messages, label)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,99 @@
+# Getting Started with Karl
+
+A 2-minute guide to launching the Ollama server and running the Karl CLI.
+
+> First time on this machine? Run `./install.sh` once first (installs Ollama +
+> Python deps, pulls the models, and adds the `karl` command).
+
+---
+
+## 1. Start the Ollama server
+
+Karl needs the Ollama daemon running (it serves the model at
+`http://localhost:11434`). You have two options:
+
+**Option A — let Karl start it for you (easiest).**
+The `karl` command auto-starts the daemon if it isn't already running. You can skip
+straight to step 2.
+
+**Option B — start it yourself.**
+
+```bash
+ollama serve            # runs in the foreground (Ctrl-C to stop)
+# ...or in the background:
+ollama serve &
+```
+
+**Or run it permanently** (auto-starts at login, survives reboots):
+
+```bash
+brew services start ollama
+```
+
+Verify it's up:
+
+```bash
+curl -s http://localhost:11434/api/tags && echo "  <- Ollama is running"
+```
+
+---
+
+## 2. Run the Karl CLI
+
+`karl` works from **any** directory. The folder you launch it in becomes its
+**workspace** — the only place its file tools and shell commands can touch.
+
+```bash
+cd ~/path/to/your/project     # the project you want Karl to work on
+karl
+```
+
+You'll see:
+
+```
+Karl — local coding agent (model: qwen3-coder:30b)
+Workspace: /Users/you/path/to/your/project
+Shell approval: prompt
+Ctrl-D or 'exit' to quit. Set ASSISTANT_DEBUG=1 to see tool calls.
+
+you ▸
+```
+
+Type a request and press Enter, e.g.:
+
+```
+you ▸ list the python files here, then add a docstring to the top of main.py
+```
+
+When Karl wants to run a shell command, you'll be asked to approve it:
+
+```
+  ⚠  the agent wants to run a shell command:
+      pytest -q
+  [y] yes, once   [p] yes, and don't ask again for 'pytest' commands   [a] yes, all commands this session   [n] no
+  >
+```
+
+To quit: type `exit`, `quit`, or press **Ctrl-D**.
+
+---
+
+## 3. Handy options
+
+```bash
+COMMAND_APPROVAL=auto karl     # don't prompt before shell commands (trusted task)
+ASSISTANT_DEBUG=1 karl         # print every model + tool call (debugging)
+WORKSPACE_ROOT=/some/dir karl  # use a different workspace than the current folder
+karl --voice                   # talk to Karl (push-to-talk) and hear her replies
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Ollama not reachable …` | Start the server: `ollama serve &` (or `brew services start ollama`). |
+| `Model 'qwen3-coder:30b' not found` | `ollama pull qwen3-coder:30b` |
+| `karl: command not found` | Re-run `./install.sh`, or open a new terminal so `PATH` refreshes. |
+| Commands never run | You're in `prompt` mode and answering `n` — answer `y`/`p`/`a`, or launch with `COMMAND_APPROVAL=auto`. |

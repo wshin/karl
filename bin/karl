@@ -1,0 +1,49 @@
+#!/bin/bash
+# Karl — local coding agent launcher.
+#
+# Workspace is the directory you run `karl` from: this script deliberately does
+# NOT change directories, so Karl's WORKSPACE_ROOT (which defaults to the current
+# working directory) is wherever you invoked the command.
+#
+# Any extra args/env pass straight through, e.g.:
+#   COMMAND_APPROVAL=auto karl
+#   ASSISTANT_DEBUG=1 karl
+
+set -euo pipefail
+
+# Resolve this script's real location (following the PATH symlink) so the launcher
+# works no matter where the Karl repo lives.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+BIN_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+KARL_HOME="$(dirname "$BIN_DIR")"
+
+PY="$KARL_HOME/.venv/bin/python"
+OLLAMA_BIN="$(command -v ollama || echo /opt/homebrew/opt/ollama/bin/ollama)"
+OLLAMA_URL="http://localhost:11434/api/tags"
+
+if [ ! -x "$PY" ]; then
+  echo "karl: Python venv not found at $PY" >&2
+  exit 1
+fi
+
+# Ensure the Ollama daemon is reachable; start it in the background if not.
+if ! curl -fsS "$OLLAMA_URL" >/dev/null 2>&1; then
+  echo "karl: starting Ollama daemon..." >&2
+  "$OLLAMA_BIN" serve >/tmp/ollama.log 2>&1 &
+  for _ in $(seq 1 30); do
+    curl -fsS "$OLLAMA_URL" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  if ! curl -fsS "$OLLAMA_URL" >/dev/null 2>&1; then
+    echo "karl: Ollama did not come up — see /tmp/ollama.log" >&2
+    exit 1
+  fi
+fi
+
+# exec preserves the current working directory => that becomes Karl's workspace.
+exec "$PY" "$KARL_HOME/assistant/main.py" "$@"

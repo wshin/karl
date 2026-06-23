@@ -1,0 +1,29 @@
+# Phase 1 (core chat loop)
+openai>=1.0
+httpx>=0.27
+
+# Phase 3 (web search) — installed now so later phases need no setup
+tavily-python>=0.5
+beautifulsoup4>=4.12
+
+# Phase 4 (long-term memory)
+chromadb>=0.5
+
+# Office documents — Kara writes real .xlsx (formulas/formatting) and .docx files
+openpyxl>=3.1
+python-docx>=1.1
+
+# Google Calendar tool (OAuth desktop flow) — optional; only needed if you set up
+# credentials.json and use the calendar skill.
+google-api-python-client>=2.0
+google-auth-oauthlib>=1.0
+google-auth-httplib2>=0.2
+
+# Phase 5 (voice) — local STT (Whisper) + neural TTS (Piper); `say` is the fallback
+faster-whisper>=1.0
+sounddevice>=0.4
+piper-tts>=1.2
+webrtcvad-wheels>=2.0   # hands-free voice-activity detection
+
+# Dev
+pytest>=8.0
