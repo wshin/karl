@@ -116,6 +116,11 @@ GOOGLE_TOKEN_PATH = os.path.abspath(os.environ.get(
 # keeps the original token.json (no re-auth); each other label gets token_<label>.json
 # beside it. Authorize each once: `python assistant/tools/google_auth.py <label>`.
 GOOGLE_ACCOUNTS = [a.strip() for a in os.environ.get("GOOGLE_ACCOUNTS", "work,personal").split(",") if a.strip()]
+# Optional user-chosen display labels for connected accounts (e.g. wontaek@gmail.com ->
+# "personal"). Karl refers to an account by its label when set, else by its email. Stored
+# as {internal-account-key: label}; editable via the set/clear-account-label tools.
+GOOGLE_LABELS_PATH = os.path.abspath(os.environ.get(
+    "GOOGLE_LABELS_PATH", os.path.join(os.path.dirname(__file__), "..", "account_labels.json")))
 CALENDAR_ID = os.environ.get("CALENDAR_ID", "primary")
 CALENDAR_CONFIRM_WRITES = os.environ.get(
     "CALENDAR_CONFIRM_WRITES", "1").lower() in {"1", "true", "yes"}

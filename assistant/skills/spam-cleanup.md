@@ -7,10 +7,10 @@ When I ask to clean up spam / declutter my inbox:
 
 0. **Which account?** Every spam tool takes an `account` argument.
    - If I have more than one account connected and I haven't said which, **call
-     `list_google_accounts` first** and ask me which one — refer to them by their **email
-     address** (e.g. "wontaek@gmail.com"), NOT internal labels like "work"/"personal".
-   - Pass my choice straight through as `account` — the tools accept **either the email
-     address or the label**, so use whichever I said.
+     `list_google_accounts` first** and ask me which one — refer to each by the **label I
+     gave it if it has one, otherwise its email address** (e.g. "wontaek@gmail.com").
+   - Pass my choice straight through as `account` — the tools accept the **email address,
+     the label, or the internal key**, so use whichever I said.
    - If I say **all / every / both accounts**, pass `account="all"` — it runs each
      connected account in sequence and labels the results by email address.
    - If only one account is connected, or I clearly mean the default, omit `account` (it

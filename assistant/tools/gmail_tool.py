@@ -253,11 +253,9 @@ def _accounts_for(account: "str | None") -> list:
 
 
 def _acct_header(account: "str | None") -> str:
-    """Label an account section by its email address when we can get it, else its label."""
+    """Label an account section by how the user refers to it: their label, else the email."""
     from . import google_auth
-    if not account:
-        return google_auth.account_email(None) or "primary"
-    return google_auth.account_email(account) or account
+    return google_auth.account_display(account)
 
 
 def find_spam_candidates(threshold: int = None, max_scan: int = None, exclude=None,

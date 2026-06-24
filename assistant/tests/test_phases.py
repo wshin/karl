@@ -1657,3 +1657,35 @@ def test_account_resolution_by_email():
         assert g._accounts_for("wontaek@gmail.com") == ["personal"]
         assert g._acct_header("work") == "wontaek@regenics.com"
     config.GOOGLE_ACCOUNTS = []
+
+
+def test_account_custom_labels():
+    """Users can label an account, address it by that label, update it, and clear it."""
+    import tempfile, os as _os
+    import config
+    from tools import google_auth as ga, accounts
+    config.GOOGLE_ACCOUNTS = ["work", "personal"]
+    emails = {"work": "wontaek@regenics.com", "personal": "wontaek@gmail.com"}
+    with tempfile.TemporaryDirectory() as d:
+        config.GOOGLE_LABELS_PATH = _os.path.join(d, "account_labels.json")
+        with mock.patch.object(ga, "available_accounts", lambda: ["work", "personal"]), \
+                mock.patch.object(ga, "account_email", lambda a: emails.get(a)):
+            # default: refer to an account by its email
+            assert ga.account_display("personal") == "wontaek@gmail.com"
+            # label it (addressing the account by email), then it's shown + addressable by label
+            accounts.set_account_label("wontaek@gmail.com", "main")
+            assert ga.account_label("personal") == "main"
+            assert ga.account_display("personal") == "main"
+            assert ga.resolve_account("main") == "personal"      # address by label
+            # update the label
+            accounts.set_account_label("main", "home")
+            assert ga.account_display("personal") == "home"
+            assert ga.resolve_account("main") == "main"          # old label no longer resolves
+            assert ga.resolve_account("home") == "personal"
+            # clear it -> back to the email
+            accounts.clear_account_label("home")
+            assert ga.account_label("personal") is None
+            assert ga.account_display("personal") == "wontaek@gmail.com"
+            # the other account was never labeled
+            assert "doesn't have a custom label" in accounts.clear_account_label("work")
+    config.GOOGLE_ACCOUNTS = []

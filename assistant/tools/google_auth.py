@@ -83,21 +83,79 @@ def account_map() -> dict:
     return {a: account_email(a) for a in available_accounts()}
 
 
+# --- user-chosen display labels (nicknames) for accounts ----------------------
+# Optional aliases on top of the email, e.g. {"personal": "main"}. Keyed by the internal
+# account key. When set, Karl refers to the account by the label; clearing reverts to the
+# email. Stored in config.GOOGLE_LABELS_PATH.
+def load_account_labels() -> dict:
+    import json
+    try:
+        with open(config.GOOGLE_LABELS_PATH, "r", encoding="utf-8") as f:
+            return {str(k): str(v) for k, v in json.load(f).items() if v}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_account_labels(labels: dict) -> None:
+    import json
+    tmp = config.GOOGLE_LABELS_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(labels, f)
+        os.replace(tmp, config.GOOGLE_LABELS_PATH)
+    except OSError as e:
+        log.debug("could not write account labels: %s", e)
+
+
+def account_label(account: "str | None") -> "str | None":
+    """The user's chosen label for an account (by internal key), or None if unlabeled."""
+    return load_account_labels().get(resolve_account(account) or primary_account())
+
+
+def set_account_label(account: "str | None", label: str) -> str:
+    """Assign/update the display label for an account. `account` may be a key, email, or
+    existing label. Returns the internal key it was set on."""
+    key = resolve_account(account) or primary_account()
+    labels = load_account_labels()
+    labels[key] = label.strip()
+    _save_account_labels(labels)
+    return key
+
+
+def clear_account_label(account: "str | None") -> str:
+    """Remove an account's label (revert to showing its email). Returns the internal key."""
+    key = resolve_account(account) or primary_account()
+    labels = load_account_labels()
+    labels.pop(key, None)
+    _save_account_labels(labels)
+    return key
+
+
+def account_display(account: "str | None") -> str:
+    """How to refer to an account in conversation: its label if set, else its email,
+    else the internal key as a last resort."""
+    key = resolve_account(account) or primary_account()
+    return load_account_labels().get(key) or account_email(key) or key
+
+
 def resolve_account(value: "str | None") -> "str | None":
-    """Map a user-facing account identifier — a short label OR a full email address
-    (case-insensitive) — to the internal label used for token/state files. None and the
-    'all' sentinel pass through unchanged; an unknown value is returned as-is so the
-    caller surfaces a clear 'not connected' error."""
+    """Map a user-facing account identifier — an internal key, a full email address, OR a
+    user-assigned display label (all case-insensitive) — to the internal key used for
+    token/state files. None and the 'all' sentinel pass through unchanged; an unknown
+    value is returned as-is so the caller surfaces a clear 'not connected' error."""
     if not value:
         return value
     v = value.strip()
     if v.lower() in {"all", "every", "everything", "both"}:
         return v
     avail = available_accounts()
-    for a in avail:                                   # already a known label?
+    for a in avail:                                   # already an internal key?
         if a and a.lower() == v.lower():
             return a
-    if "@" in v:                                      # an email address — find its label
+    for key, label in load_account_labels().items():  # a user-assigned label?
+        if label.lower() == v.lower() and key in avail:
+            return key
+    if "@" in v:                                      # an email address — find its key
         for a in avail:
             em = account_email(a)
             if em and em.lower() == v.lower():

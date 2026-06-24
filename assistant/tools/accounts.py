@@ -10,20 +10,50 @@ log = logging.getLogger("assistant.accounts")
 
 
 def list_google_accounts() -> str:
-    """List the Google (Gmail + Calendar) accounts Karl is connected to."""
+    """List the Google (Gmail + Calendar) accounts Karl is connected to, by email and
+    (if the user set one) their chosen label."""
     from . import google_auth
     connected = google_auth.available_accounts()
     lines = []
     for acct in connected:
         email = google_auth.account_email(acct) or "(address unavailable)"
-        tag = " — primary" if acct == google_auth.primary_account() else ""
-        lines.append(f"- {acct}: {email}{tag}")
+        label = google_auth.account_label(acct)
+        primary = " — primary" if acct == google_auth.primary_account() else ""
+        # Lead with the email; show the user's label after it when one is set.
+        lines.append(f"- {email}" + (f"  (label: {label})" if label else "") + primary)
     out = "Connected Google accounts:\n" + ("\n".join(lines) if lines else "  (none yet)")
     pending = [a for a in config.GOOGLE_ACCOUNTS if a not in connected]
     if pending:
         out += ("\nConfigured but not yet connected: " + ", ".join(pending)
                 + " — ask me to connect one and I'll open the browser.")
     return out
+
+
+def set_account_label(account: str, label: str) -> str:
+    """Give a connected account a custom display label (or update its existing one), so
+    Karl refers to it by that name instead of the email. `account` may be an email, the
+    current label, or the internal key."""
+    from . import google_auth
+    if not (label or "").strip():
+        return "Tell me what label to use (e.g. 'personal', 'work', 'main inbox')."
+    email = google_auth.account_email(account)
+    if not email and google_auth.resolve_account(account) not in google_auth.available_accounts():
+        return (f"I don't have a connected account matching '{account}'. "
+                "Ask me to list your accounts to see the options.")
+    google_auth.set_account_label(account, label)
+    return f"Done — I'll call {email or account} \"{label.strip()}\" from now on."
+
+
+def clear_account_label(account: str) -> str:
+    """Remove a connected account's custom label so Karl refers to it by its email again.
+    `account` may be an email, the current label, or the internal key."""
+    from . import google_auth
+    had = google_auth.account_label(account)
+    email = google_auth.account_email(account)
+    if not had:
+        return f"{email or account} doesn't have a custom label — I already use its email."
+    google_auth.clear_account_label(account)
+    return f"Removed the \"{had}\" label — I'll refer to {email or account} by its email now."
 
 
 def connect_google_account(account: str) -> str:
@@ -84,6 +114,42 @@ CONNECT_ACCOUNT_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {"account": {"type": "string", "description": "A short label for the account, e.g. 'personal' or 'work'."}},
+            "required": ["account"],
+        },
+    },
+}
+
+SET_ACCOUNT_LABEL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "set_account_label",
+        "description": "Give a connected Google account a custom display label / nickname (or "
+                       "change its current one), so you refer to it by that name instead of its "
+                       "email address. Use when the user says to call/label/name an account "
+                       "something (e.g. 'call wontaek@gmail.com my personal account').",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "account": {"type": "string", "description": "Which account — its email address, current label, or internal key."},
+                "label": {"type": "string", "description": "The label/nickname to use (e.g. 'personal', 'work', 'main inbox')."},
+            },
+            "required": ["account", "label"],
+        },
+    },
+}
+
+CLEAR_ACCOUNT_LABEL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "clear_account_label",
+        "description": "Remove a connected Google account's custom label so you refer to it by "
+                       "its email address again. Use when the user says to remove/clear/reset "
+                       "an account's label or nickname.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "account": {"type": "string", "description": "Which account — its email address, current label, or internal key."},
+            },
             "required": ["account"],
         },
     },

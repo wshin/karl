@@ -48,10 +48,13 @@ if config.REASONING_ENABLED:
 # Google service is set up.
 if config.CALENDAR_ENABLED or config.GMAIL_ENABLED:
     from . import accounts
-    TOOLS += [accounts.LIST_ACCOUNTS_SCHEMA, accounts.CONNECT_ACCOUNT_SCHEMA]
+    TOOLS += [accounts.LIST_ACCOUNTS_SCHEMA, accounts.CONNECT_ACCOUNT_SCHEMA,
+              accounts.SET_ACCOUNT_LABEL_SCHEMA, accounts.CLEAR_ACCOUNT_LABEL_SCHEMA]
     TOOL_FUNCTIONS.update({
         "list_google_accounts": accounts.list_google_accounts,
         "connect_google_account": accounts.connect_google_account,
+        "set_account_label": accounts.set_account_label,
+        "clear_account_label": accounts.clear_account_label,
     })
 
 # Google Calendar tools appear only when set up (credentials.json present) or forced
