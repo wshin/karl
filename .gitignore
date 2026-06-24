@@ -36,3 +36,7 @@ spam_scan_state.json
 # Agent-written personal-data artifacts (kept locally, never committed)
 user_info/
 remembered_facts.md
+
+# stray agent-written memory artifacts (Karl uses ChromaDB, not these)
+assistant/ memories/
+assistant/memories/
