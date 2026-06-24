@@ -30,3 +30,10 @@ pytest>=8.0
 
 # Conservative typo autocorrect for user input (offline)
 pyspellchecker>=0.8
+
+
+# Optional animated face window (karl --face)
+pygame-ce>=2.5
+
+# Syntax highlighting for code in CLI output
+Pygments>=2.17

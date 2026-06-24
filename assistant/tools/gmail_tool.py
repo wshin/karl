@@ -242,7 +242,18 @@ def _count_unread(svc, query: str, cap: int = 5000) -> int:
     return total
 
 
-def find_spam_candidates(threshold: int = None, max_scan: int = None, exclude=None) -> list:
+def _accounts_for(account: "str | None") -> list:
+    """Resolve a tool's `account` arg to the concrete account(s) to act on. 'all' (or
+    'every'/'both') expands to every connected account; anything else is used as-is
+    (None = the primary account)."""
+    if account and account.strip().lower() in {"all", "every", "everything", "both"}:
+        from . import google_auth
+        return google_auth.available_accounts() or [None]
+    return [account]
+
+
+def find_spam_candidates(threshold: int = None, max_scan: int = None, exclude=None,
+                         account: str = None) -> list:
     """Scan unread mail, group by sender, and return senders with MORE THAN
     `threshold` unread messages — likely spam/newsletters. Read-only; deletes
     nothing. `max_scan` caps how many unread are sampled to DISCOVER senders;
@@ -257,7 +268,7 @@ def find_spam_candidates(threshold: int = None, max_scan: int = None, exclude=No
         max_scan = config.SPAM_SCAN_MAX
     unlimited = max_scan <= 0
     keep = {s.lower() for s in (exclude or [])}   # addresses/domains to skip
-    svc = _service()  # raises on missing creds — callers handle
+    svc = _service(account)  # raises on missing creds — callers handle
     ids, req = [], svc.users().messages().list(userId="me", q="is:unread", maxResults=500)
     while req is not None and (unlimited or len(ids) < max_scan):
         resp = req.execute()
@@ -295,14 +306,22 @@ _PICK_HINT = ('\nSay e.g. "always delete from 1, 3" (auto-delete those from now 
               '"delete 2" (trash once), "unsubscribe 4", or "keep 5".')
 
 
-def find_spam_candidates_text(threshold: int = None, full: bool = False) -> str:
+def find_spam_candidates_text(threshold: int = None, full: bool = False,
+                              account: str = None) -> str:
     """Human/model-readable version of find_spam_candidates (for the tool registry).
     `full=True` scans the ENTIRE unread history (deeper, slower) instead of a sample.
-    Keep-list and auto-delete senders are excluded; results are numbered."""
+    `account` picks which connected account (or 'all' for every one). Keep-list and
+    auto-delete senders are excluded; results are numbered."""
+    accts = _accounts_for(account)
+    if len(accts) > 1:
+        return "\n\n".join(f"=== {a or 'primary'} ===\n"
+                           + find_spam_candidates_text(threshold, full, a) for a in accts)
+    account = accts[0]
     try:
         import spam
-        cands = find_spam_candidates(threshold, max_scan=0 if full else None,
-                                     exclude=spam.load_keep() | spam.load_autodelete())
+        cands = find_spam_candidates(
+            threshold, max_scan=0 if full else None, account=account,
+            exclude=spam.load_keep(account) | spam.load_autodelete(account))
     except Exception as e:  # noqa: BLE001
         return f"ERROR: {e}"
     scope = "entire unread history" if full else "a sample of recent unread"
@@ -332,6 +351,47 @@ def _trash_ids(svc, ids: list) -> None:
                 userId="me", body={"ids": chunk, "addLabelIds": ["TRASH"]}).execute()
 
 
+def _iter_unread_ids(svc, sender: str):
+    """Yield ids of UNREAD messages from `sender`, paging lazily (never touches read
+    mail). Streamed so a huge sender can be trashed in batches without buffering it all."""
+    req = svc.users().messages().list(
+        userId="me", q=f"from:{sender} is:unread", maxResults=500)
+    while req is not None:
+        resp = req.execute()
+        for m in resp.get("messages", []):
+            yield m["id"]
+        req = svc.users().messages().list_next(req, resp)
+
+
+def auto_trash_blocked_batched(senders, batch_size: int = None,
+                               account: str = None) -> "tuple[int, dict]":
+    """Trash unread from confirmed-junk senders in batches of `batch_size`, announcing the
+    running total after each full batch — for long histories where one sender can have
+    tens of thousands of unread. Because the query is is:unread, already-trashed mail
+    leaves the unread set, so an interrupted run simply resumes on the next call (no extra
+    checkpoint needed). Returns (total_trashed, {sender: count})."""
+    import spam
+    if batch_size is None:
+        batch_size = config.SPAM_BATCH_SIZE
+    svc = _service(account)
+    per: dict = {}
+    total = 0
+    buf: list = []
+    for s in senders:
+        for mid in _iter_unread_ids(svc, s):
+            buf.append(mid)
+            per[s] = per.get(s, 0) + 1
+            if len(buf) >= batch_size:
+                _trash_ids(svc, buf)
+                total += len(buf)
+                buf = []
+                spam.announce(f"Trashed {total:,} unread so far…")
+    if buf:                                   # final partial batch
+        _trash_ids(svc, buf)
+        total += len(buf)
+    return total, per
+
+
 def _excluded(sender: str, entries: set) -> bool:
     """Match by exact address, exact domain, or parent domain ('regenics.com' also
     covers 'send.regenics.com')."""
@@ -350,11 +410,11 @@ def _format_candidates(cands: list) -> str:
         for i, c in enumerate(cands, 1))
 
 
-def trash_from_sender(sender: str, max_delete: int = 500) -> str:
+def trash_from_sender(sender: str, max_delete: int = 500, account: str = None) -> str:
     """Move all UNREAD messages from `sender` to Trash, after ONE confirmation naming
     the sender and count. Only touches UNREAD/unopened mail; recoverable (Trash)."""
     try:
-        svc = _service()
+        svc = _service(account)
         ids = _unread_ids_from(svc, sender, max_delete)
     except Exception as e:  # noqa: BLE001
         return f"ERROR: {e}"
@@ -369,10 +429,10 @@ def trash_from_sender(sender: str, max_delete: int = 500) -> str:
     return f"Moved {len(ids)} email(s) from {sender} to Trash."
 
 
-def auto_trash_blocked(senders) -> "tuple[int, dict]":
+def auto_trash_blocked(senders, account: str = None) -> "tuple[int, dict]":
     """Trash unread from each pre-confirmed auto-delete sender WITHOUT prompting (the
     user authorized these by adding them to the list). Returns (total, per-sender)."""
-    svc = _service()  # raises on missing creds — caller handles
+    svc = _service(account)  # raises on missing creds — caller handles
     total, per = 0, {}
     for s in senders:
         try:
@@ -386,12 +446,12 @@ def auto_trash_blocked(senders) -> "tuple[int, dict]":
     return total, per
 
 
-def auto_delete_sender(sender: str) -> str:
+def auto_delete_sender(sender: str, account: str = None) -> str:
     """Add a sender to the auto-delete list and clear their current unread now."""
     import spam
-    spam.add_autodelete(sender)
+    spam.add_autodelete(sender, account)
     try:
-        svc = _service()
+        svc = _service(account)
         ids = _unread_ids_from(svc, sender)
         _trash_ids(svc, ids)
     except Exception as e:  # noqa: BLE001
@@ -401,10 +461,10 @@ def auto_delete_sender(sender: str) -> str:
             "Future unread from them is auto-trashed by the background scan, no prompts.")
 
 
-def keep_sender(sender: str) -> str:
+def keep_sender(sender: str, account: str = None) -> str:
     """Mark a sender (address or domain) as 'keep' so spam cleanup never flags it."""
     import spam
-    spam.add_keep(sender)
+    spam.add_keep(sender, account)
     return f"Added {sender} to the keep-list — it won't be flagged as spam again."
 
 
@@ -417,13 +477,16 @@ KEEP_SENDER_SCHEMA = {
                        "keep, whitelist, or never delete a sender.",
         "parameters": {
             "type": "object",
-            "properties": {"sender": {"type": "string", "description": "Email address (team@x.com) or domain (x.com)."}},
+            "properties": {
+                "sender": {"type": "string", "description": "Email address (team@x.com) or domain (x.com)."},
+                "account": {"type": "string", "description": "Which connected account this applies to (e.g. 'work', 'personal'). Omit for the primary account."},
+            },
             "required": ["sender"],
         },
     },
 }
 
-def scan_candidates_batched(threshold: int = None, exclude=None) -> list:
+def scan_candidates_batched(threshold: int = None, exclude=None, account: str = None) -> list:
     """Full unread scan in resumable batches: checkpoint after each Gmail page so an
     interruption resumes where it left off, and announce after each batch. Exact counts
     (every message is counted). Used for large mailboxes by deep_spam_cleanup."""
@@ -432,9 +495,9 @@ def scan_candidates_batched(threshold: int = None, exclude=None) -> list:
     if threshold is None:
         threshold = config.SPAM_UNREAD_THRESHOLD
     keep = {s.lower() for s in (exclude or [])}
-    svc = _service()
+    svc = _service(account)
 
-    st = spam.load_scan_state()
+    st = spam.load_scan_state(account)
     by_sender = defaultdict(int, st.get("by_sender", {}))
     has_unsub = dict(st.get("unsub", {}))
     scanned = int(st.get("scanned", 0))
@@ -470,7 +533,8 @@ def scan_candidates_batched(threshold: int = None, exclude=None) -> list:
                 has_unsub[sender] = True
         page_token = resp.get("nextPageToken")
         spam.save_scan_state({"by_sender": dict(by_sender), "unsub": has_unsub,
-                              "scanned": scanned, "page_token": page_token, "total_est": total_est})
+                              "scanned": scanned, "page_token": page_token,
+                              "total_est": total_est}, account)
         if since >= config.SPAM_BATCH_SIZE or not page_token:
             spam.announce(f"Scanned {scanned:,} of ~{total_est:,} emails…")
             since = 0
@@ -478,51 +542,60 @@ def scan_candidates_batched(threshold: int = None, exclude=None) -> list:
     cands = [{"sender": s, "count": c, "unsubscribe": has_unsub.get(s, False), "ids": []}
              for s, c in by_sender.items() if c > threshold]
     cands.sort(key=lambda c: -c["count"])
-    spam.clear_scan_state()
+    spam.clear_scan_state(account)
     return cands
 
 
-def deep_spam_cleanup() -> str:
-    """DEEP cleanup: across the ENTIRE history, auto-trash every unread from the
-    confirmed auto-delete list, then full-scan for NEW candidates (numbered, with
-    keep-list / @regenics.com excluded). Returns a report for the user to pick from."""
+def deep_spam_cleanup(account: str = None) -> str:
+    """DEEP cleanup across the ENTIRE history for one account — or, when `account` is
+    'all', every connected account in sequence. Each account keeps its own auto-delete /
+    keep lists and candidate review list."""
+    accts = _accounts_for(account)
+    if len(accts) > 1:
+        return "\n\n".join(f"=== {a or 'primary'} ===\n" + _deep_spam_cleanup_one(a)
+                           for a in accts)
+    return _deep_spam_cleanup_one(accts[0])
+
+
+def _deep_spam_cleanup_one(account: str = None) -> str:
+    """DEEP cleanup for a single account: across the ENTIRE history, auto-trash every
+    unread from the confirmed auto-delete list, then full-scan for NEW candidates
+    (numbered, with keep-list / @regenics.com excluded). Returns a report to pick from."""
     import spam
     try:
-        svc = _service()
+        svc = _service(account)
     except Exception as e:  # noqa: BLE001
         return f"ERROR: {e}"
-    block = spam.load_autodelete()
+    block = spam.load_autodelete(account)
     total, per = 0, {}
     if block:
-        spam.announce("Clearing unread from your auto-delete senders…")
-    for s in block:
+        spam.announce(f"Clearing unread from your auto-delete senders in batches of "
+                      f"{config.SPAM_BATCH_SIZE:,}…")
         try:
-            ids = _unread_ids_from(svc, s, max_delete=100000)  # whole history
-            if ids:
-                _trash_ids(svc, ids)
-                per[s] = len(ids)
-                total += len(ids)
+            # Stream + trash in batches across the whole history (handles a sender with
+            # tens of thousands of unread without buffering them all or one giant call).
+            total, per = auto_trash_blocked_batched(block, account=account)
         except Exception as e:  # noqa: BLE001
-            log.debug("deep auto-trash %s failed: %s", s, e)
+            log.debug("deep auto-trash failed: %s", e)
     if total:
         spam.announce(f"Auto-deleted {total:,} unread from your confirmed list.")
 
     # New-candidate scan: resumable batches if a scan is in progress or the mailbox is
     # large (>SPAM_BATCH_THRESHOLD unread); otherwise a single fast pass.
-    exclude = spam.load_keep() | block
+    exclude = spam.load_keep(account) | block
     try:
-        resuming = bool(spam.load_scan_state())
+        resuming = bool(spam.load_scan_state(account))
         est = svc.users().messages().list(
             userId="me", q="is:unread", maxResults=1).execute().get("resultSizeEstimate", 0)
         if resuming or est > config.SPAM_BATCH_THRESHOLD:
             spam.announce(f"Scanning ~{est:,} unread in batches (resumes if interrupted)…")
-            cands = scan_candidates_batched(exclude=exclude)
+            cands = scan_candidates_batched(exclude=exclude, account=account)
         else:
-            cands = find_spam_candidates(max_scan=0, exclude=exclude)
+            cands = find_spam_candidates(max_scan=0, exclude=exclude, account=account)
     except Exception as e:  # noqa: BLE001
         return (f"Auto-deleted {total} unread from your safe list, but the new-candidate scan "
                 f"failed (it will resume next time): {e}")
-    spam.record_candidates(cands)
+    spam.record_candidates(cands, account)
     head = f"Deep cleanup done. Auto-deleted {total:,} unread"
     head += (f" from your auto-delete list ({len(block)} sender(s) on it)."
              if block else " (no senders on your auto-delete list yet).")
@@ -546,7 +619,13 @@ DEEP_CLEANUP_SCHEMA = {
                        "spam candidates (numbered) to review. Use when the user asks for a "
                        "'deep' email/spam cleanup. After showing the result, act on the "
                        "numbers the user picks.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "account": {"type": "string", "description": "Which connected account to clean (e.g. 'work', 'personal'). Omit for the primary account, or pass 'all' to clean EVERY connected account in sequence."},
+            },
+            "required": [],
+        },
     },
 }
 
@@ -561,7 +640,10 @@ AUTO_DELETE_SENDER_SCHEMA = {
                        "one-time delete, use trash_from_sender instead.",
         "parameters": {
             "type": "object",
-            "properties": {"sender": {"type": "string", "description": "Email address (x@y.com) or domain (y.com)."}},
+            "properties": {
+                "sender": {"type": "string", "description": "Email address (x@y.com) or domain (y.com)."},
+                "account": {"type": "string", "description": "Which connected account this applies to (e.g. 'work', 'personal'). Omit for the primary account."},
+            },
             "required": ["sender"],
         },
     },
@@ -581,6 +663,7 @@ FIND_SPAM_SCHEMA = {
             "properties": {
                 "threshold": {"type": "integer", "description": "Min unread from one sender to flag (default 10)."},
                 "full": {"type": "boolean", "description": "Scan the entire unread history instead of a sample (deeper, slower)."},
+                "account": {"type": "string", "description": "Which connected account to scan (e.g. 'work', 'personal'). Omit for the primary account, or pass 'all' for every connected account."},
             },
             "required": [],
         },
@@ -598,6 +681,7 @@ TRASH_FROM_SENDER_SCHEMA = {
             "type": "object",
             "properties": {
                 "sender": {"type": "string", "description": "The sender's email address."},
+                "account": {"type": "string", "description": "Which connected account this applies to (e.g. 'work', 'personal'). Omit for the primary account."},
             },
             "required": ["sender"],
         },

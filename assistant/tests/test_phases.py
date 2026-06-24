@@ -541,6 +541,26 @@ def test_wake_word_gating():
     assert voice.strip_wake_word("hey there how are you") is None
 
 
+def test_wake_word_mishearings_and_filler():
+    """Whisper often writes 'Karl' as 'Carl'/'call' and prepends filler — still wake."""
+    import voice
+    # the big one: 'Carl' with a C, the most common mis-transcription
+    assert voice.strip_wake_word("carl what time is it") == "what time is it"
+    assert voice.strip_wake_word("hey carl whats the weather") == "whats the weather"
+    # everyday-word mishearings ('call', 'cole', 'curl') — only with a greeting
+    assert voice.strip_wake_word("hey call can you help") == "can you help"
+    assert voice.strip_wake_word("okay carl") == ""
+    # leading filler words before the wake phrase
+    assert voice.strip_wake_word("um hey karl open mail") == "open mail"
+    assert voice.strip_wake_word("so karl what's up") == "what's up"
+    assert voice.strip_wake_word("hey there karl") == ""
+    # a bare everyday word (no greeting) must NOT hijack the agent
+    assert voice.strip_wake_word("call mom") is None
+    assert voice.strip_wake_word("can you call steve") is None
+    assert voice.strip_wake_word("carlos came over") is None
+    assert voice.strip_wake_word("the cole mine collapsed") is None
+
+
 def _voice_ok() -> bool:
     import importlib.util
     import shutil
@@ -1544,3 +1564,73 @@ def test_autocorrect_fixes_typos_but_protects_names_and_code():
     # disabled → no-op
     with mock.patch.object(config, "AUTOCORRECT", False):
         assert typo.correct("recieved teh flowers") == "recieved teh flowers"
+
+
+def test_terse_followup_continues_current_topic():
+    import main
+    # one/two-word topical messages are terse follow-ups
+    for s in ["china", "weather", "in china", "tokyo", "the economy", "what about japan"]:
+        assert main._is_terse_followup(s), s
+    # complete short replies, greetings, commands, and full sentences are NOT
+    for s in ["yes", "thanks", "ok", "hello", "exit", "good morning",
+              "hows the weather up there", "what is the capital of france"]:
+        assert not main._is_terse_followup(s), s
+
+    # end to end: after a weather answer, "china" skips recall (no stray Reno memory)
+    # and is steered to continue the topic (weather in China)
+    captured, recalled = {}, {"hit": False}
+    def fake_agent(msgs, on_token=None):
+        captured["t"] = msgs[-1]["content"]
+        return "x"
+    def fake_recall(q):
+        recalled["hit"] = True
+        return [{"text": "Karl was born in Reno", "ts": 0, "distance": 0.1, "scope": "global"}]
+    msgs = [{"role": "system", "content": "s"},
+            {"role": "user", "content": "hows the weather there"},
+            {"role": "assistant", "content": "Reno is sunny, 75F."}]
+    with mock.patch.object(main, "agent_turn", fake_agent), \
+            mock.patch.object(main, "recall", fake_recall):
+        main.process_turn(msgs, "china")
+    assert not recalled["hit"]                       # no stray memory pulled in
+    assert "TERSE follow-up" in captured["t"]        # steered to continue the topic
+    assert "Reno" not in captured["t"]               # birthplace memory not injected
+
+
+def test_spam_state_is_per_account():
+    import importlib, tempfile, os as _os
+    import config, spam
+    config.GOOGLE_ACCOUNTS = ["work", "personal"]
+    importlib.reload(spam)
+    with tempfile.TemporaryDirectory() as d:
+        config.SPAM_KEEP_PATH = _os.path.join(d, "spam_keep.json")
+        config.SPAM_AUTODELETE_PATH = _os.path.join(d, "spam_autodelete.json")
+        # primary ('work') uses the base file; 'personal' gets a suffixed file
+        assert spam._p(config.SPAM_KEEP_PATH, "work") == config.SPAM_KEEP_PATH
+        assert spam._p(config.SPAM_KEEP_PATH, None) == config.SPAM_KEEP_PATH
+        assert spam._p(config.SPAM_KEEP_PATH, "personal").endswith("spam_keep_personal.json")
+        # keeping a sender in one account must NOT leak into the other
+        spam.add_keep("news@a.com", account="personal")
+        spam.add_autodelete("junk@b.com", account="work")
+        assert "news@a.com" in spam.load_keep("personal")
+        assert "news@a.com" not in spam.load_keep("work")
+        assert "junk@b.com" in spam.load_autodelete("work")
+        assert "junk@b.com" not in spam.load_autodelete("personal")
+    config.GOOGLE_ACCOUNTS = []
+    importlib.reload(spam)
+
+
+def test_spam_cleanup_all_runs_every_account():
+    import importlib
+    import config, spam
+    config.GOOGLE_ACCOUNTS = ["work", "personal"]
+    importlib.reload(spam)
+    from tools import gmail_tool
+    with mock.patch.object(gmail_tool, "_deep_spam_cleanup_one", lambda a: f"done:{a}"), \
+            mock.patch("tools.google_auth.available_accounts", lambda: ["work", "personal"]):
+        out = gmail_tool.deep_spam_cleanup("all")
+        assert "=== work ===" in out and "done:work" in out
+        assert "=== personal ===" in out and "done:personal" in out
+        # a single named account doesn't fan out
+        assert gmail_tool.deep_spam_cleanup("work") == "done:work"
+    config.GOOGLE_ACCOUNTS = []
+    importlib.reload(spam)

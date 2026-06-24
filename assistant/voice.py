@@ -84,12 +84,21 @@ def estimate_seconds(text: str) -> float:
 
 # --- wake word --------------------------------------------------------------
 
-# Generous set of ways Whisper renders "Karl"/"Cara" — we never fuss over the
-# mispronunciation, we just go with it.
-_WAKE_NAME = (r"karl|cara|carra|karra|kahra|khara|kaara|karlh|carah|caro|cora|"
-              r"kira|kyra|keira|kaira|qara|khara|ckarl")
+# Generous set of ways Whisper (esp. the small .en models) renders "Karl"/"Cara" — we
+# never fuss over the mispronunciation, we just go with it. Split in two:
+#   SAFE  — name-like enough to trigger on their own ("Karl", "Carl", "Cara"…).
+#   LOOSE — real everyday words Whisper often hears for "Karl" ("call", "cole", "curl").
+#           Allowed ONLY after a greeting, so a bare "call mom" doesn't hijack the agent.
+_WAKE_SAFE = (r"karl|karle|karlh|karrl|carl|carle|carrl|kahl|kahrl|cara|carah|carra|"
+              r"karra|kahra|khara|kaara|caro|cora|carel|carlo|carla|charl|scarl|"
+              r"kira|kyra|keira|kaira|qara|ckarl")
+_WAKE_LOOSE = r"call|cal|kal|cole|kohl|coal|curl|kerl|carol|coral"
+_GREET = r"(?:hey|hi|hello|hiya|yo|hay|ok|okay)(?:\s+there)?"
+_FILLER = r"(?:um|uh|er|hm|so|oh|well|and|hey|hi)"   # tolerated leading words
 _WAKE_RE = re.compile(
-    rf"(?i)^\W*(?:(?:hey|hi|hello|okay|ok|yo|hay)\b[\s,!.]*)?(?:{_WAKE_NAME})\b[\s,.!:?\"'-]*"
+    rf"(?i)^\W*(?:{_FILLER}\b[\s,!.]*){{0,2}}"
+    rf"(?:(?:{_GREET})\b[\s,!.]*(?:{_WAKE_SAFE}|{_WAKE_LOOSE})|(?:{_WAKE_SAFE}))"
+    rf"\b[\s,.!:?\"'-]*"
 )
 
 
@@ -369,7 +378,14 @@ def _get_model():
 def transcribe(audio) -> str:
     """Transcribe a 16 kHz mono float32 numpy array (or an audio file path) to text."""
     try:
-        segments, _ = _get_model().transcribe(audio, language="en", vad_filter=True)
+        # `hotwords` biases the model toward the wake word so "Karl" is heard as Karl
+        # (not "Carl"/"call"); harmless on older builds that ignore the kwarg.
+        kw = {"hotwords": config.WHISPER_HOTWORDS} if config.WHISPER_HOTWORDS else {}
+        try:
+            segments, _ = _get_model().transcribe(
+                audio, language="en", vad_filter=True, **kw)
+        except TypeError:                       # faster-whisper without hotwords support
+            segments, _ = _get_model().transcribe(audio, language="en", vad_filter=True)
         return " ".join(s.text.strip() for s in segments).strip()
     except Exception as e:  # noqa: BLE001
         log.debug("transcribe failed: %s", e)

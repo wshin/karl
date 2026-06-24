@@ -25,6 +25,35 @@ from memory.store import recall, save_memory
 
 log = logging.getLogger("assistant.main")
 
+# --- terminal colors + code syntax highlighting -------------------------------
+# Colors only when writing to a real terminal (and NO_COLOR isn't set).
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+_BLUE = "\033[38;5;117m" if _COLOR else ""   # light blue — the user's prompt + input
+_DIM = "\033[2m" if _COLOR else ""
+_RESET = "\033[0m" if _COLOR else ""
+
+
+def _highlight(code: str, lang: str) -> str:
+    """ANSI-syntax-highlight a code block (best-effort; plain text on any failure)."""
+    if not _COLOR or not code.strip():
+        return code
+    try:
+        from pygments import highlight
+        from pygments.lexers import get_lexer_by_name, guess_lexer
+        from pygments.formatters import Terminal256Formatter
+        lexer = None
+        if lang:
+            try:
+                lexer = get_lexer_by_name(lang)
+            except Exception:  # noqa: BLE001
+                lexer = None
+        if lexer is None:
+            lexer = guess_lexer(code)
+        return highlight(code, lexer, Terminal256Formatter(style="monokai")).rstrip("\n")
+    except Exception:  # noqa: BLE001
+        return code
+
+
 # --- memory orchestration: ask / tell / confirm / retract / restore -----------
 # A deferred offer awaiting the user's "yes": ("save", fact) or ("restore", text).
 _pending = None
@@ -365,6 +394,25 @@ def _is_revision_request(text: str) -> bool:
 def _refers_to_previous(text: str) -> bool:
     """A reaction or a revision request — both point at the last answer, not a new topic."""
     return _is_short_reaction(text) or _is_revision_request(text)
+
+
+# Terse one/two-word messages that aren't complete on their own ("china", "weather",
+# "in spanish") almost always CONTINUE the current topic — combine them with the prior
+# exchange. These short replies are complete and should NOT be treated that way.
+_TERSE_COMPLETE = {"yes", "no", "yeah", "yep", "yup", "nope", "nah", "ok", "okay", "sure",
+                   "thanks", "thank you", "hi", "hello", "hey", "bye", "goodbye", "please",
+                   "cool", "nice", "wow", "lol", "good", "great", "fine", "done", "stop",
+                   "quit", "exit", "go", "yo", "sup", "good morning", "good night", "morning"}
+
+
+def _is_terse_followup(text: str) -> bool:
+    t = (text or "").strip().lower().rstrip("?.!,")
+    words = t.split()
+    if not (1 <= len(words) <= 3) or t in _TERSE_COMPLETE:
+        return False
+    if _refers_to_previous(text) or _is_identity_question(text):  # handled elsewhere
+        return False
+    return all(re.fullmatch(r"[a-z'’-]+", w) for w in words)  # plain words, not code/commands
 
 
 # A request/question, not a personal statement — skip casual fact extraction on these so
@@ -778,21 +826,93 @@ def _system_message() -> dict:
             "content": config.SYSTEM_PROMPT.format(name=config.AGENT_NAME, date=today)}
 
 
+class _Face:
+    """Controls Karl's animated face window (a face.py subprocess) via state commands:
+    idle / listening / thinking / speaking. Degrades to a no-op if it can't start."""
+
+    def __init__(self):
+        self.proc = None
+
+    def start(self):
+        import subprocess
+        path = os.path.join(os.path.dirname(__file__), "face.py")
+        try:
+            self.proc = subprocess.Popen([sys.executable, path], stdin=subprocess.PIPE, text=True)
+        except Exception as e:  # noqa: BLE001
+            log.debug("face window failed to start: %s", e)
+            self.proc = None
+
+    def set(self, state: str):
+        if not self.proc or self.proc.poll() is not None:
+            return
+        try:
+            self.proc.stdin.write(state + "\n")
+            self.proc.stdin.flush()
+        except Exception:  # noqa: BLE001 — a dead face must never break the loop
+            pass
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.set("quit")
+            try:
+                self.proc.wait(timeout=1)
+            except Exception:  # noqa: BLE001
+                self.proc.terminate()
+
+
+class _NoFace:
+    """Stand-in when --face isn't used — every call is a no-op."""
+    def set(self, *_a): pass
+    def stop(self): pass
+
+
 class _Printer:
-    """Streams the assistant's reply to the terminal, printing the label prefix
-    lazily on the first token (so tool-resolution steps stay silent)."""
+    """Streams the assistant's reply to the terminal — prose line by line, with fenced
+    ```code``` blocks buffered and syntax-highlighted. The label prefix prints lazily on
+    the first token (so tool-resolution steps stay silent)."""
 
     def __init__(self, label: str):
         self.label = label
         self.started = False
+        self._buf = ""            # incomplete trailing line not yet printed
+        self._in_code = False
+        self._code: list[str] = []
+        self._lang = ""
 
     def write(self, text: str) -> None:
         if not self.started:
             print(f"{self.label} ▸ ", end="", flush=True)
             self.started = True
-        print(text, end="", flush=True)
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._line(line)
+
+    def _line(self, line: str) -> None:
+        if line.lstrip().startswith("```"):
+            if not self._in_code:                      # opening fence
+                self._in_code, self._lang, self._code = True, line.strip()[3:].strip(), []
+            else:                                      # closing fence
+                self._flush_code()
+            return
+        if self._in_code:
+            self._code.append(line)
+        else:
+            print(line, flush=True)                    # prose line
+
+    def _flush_code(self) -> None:
+        code = "\n".join(self._code)
+        print(f"{_DIM}```{self._lang}{_RESET}")
+        print(_highlight(code, self._lang))
+        print(f"{_DIM}```{_RESET}", flush=True)
+        self._in_code, self._code, self._lang = False, [], ""
 
     def finish(self) -> None:
+        if self._buf:                                  # flush a trailing line with no newline
+            self._line(self._buf)
+            self._buf = ""
+        if self._in_code:                              # unterminated block — show what we have
+            self._flush_code()
         if self.started:
             print()
 
@@ -854,7 +974,7 @@ def process_turn(messages: list[dict], user_input: str, printer: "_Printer | Non
     # the current conversation ("what's good there?") or a recap request ("what have we
     # been talking about?"), so a stray memory can't hijack or pollute the answer.
     if (_is_followup_reference(user_input) or _is_conversation_recap(user_input)
-            or _refers_to_previous(user_input)):
+            or _refers_to_previous(user_input) or _is_terse_followup(user_input)):
         mems = []
     else:
         try:
@@ -884,13 +1004,21 @@ def process_turn(messages: list[dict], user_input: str, printer: "_Printer | Non
     # "rephrase that") refers to the LAST answer — steer the model to revise/respond to
     # THAT, instead of drifting onto an unrelated memory or an identity spiel.
     reaction_steer = ""
-    if _refers_to_previous(user_input) and any(
-            m.get("role") == "assistant" for m in messages[:base_len]):
+    _has_prior = any(m.get("role") == "assistant" for m in messages[:base_len])
+    if _refers_to_previous(user_input) and _has_prior:
         reaction_steer = (
             "[This refers to your PREVIOUS answer — revise or respond to THAT exact output "
             "(e.g. shorten/rephrase/justify it, or answer the reaction). Stay on the same "
             "topic; do NOT switch subjects, introduce unrelated facts, or start talking "
             "about yourself or who made you.]")
+    elif _is_terse_followup(user_input) and _has_prior:
+        reaction_steer = (
+            "[This is a TERSE follow-up — it continues what we were just discussing. Combine "
+            "this short message with the CURRENT topic from the recent messages; do NOT treat "
+            "it as a brand-new subject or default to your own location/identity. E.g. right "
+            "after I asked about the weather somewhere, 'China' means the weather in China, and "
+            "'weather' still means the weather of the last place we named. Only treat it as a "
+            "new topic if it clearly can't be a continuation.]")
 
     # Fold context into the user turn (transiently — restored to clean after).
     preface = _memory_preface(mems) if mems else ""
@@ -932,19 +1060,34 @@ def process_turn(messages: list[dict], user_input: str, printer: "_Printer | Non
     return reply
 
 
-def _text_loop(messages: list[dict], label: str) -> None:
-    while True:
+def _text_loop(messages: list[dict], label: str, face=None, speak: bool = False) -> None:
+    face = face or _NoFace()
+    _voice = None
+    if speak:                       # type to Karl, but he answers ALOUD (e.g. --face)
         try:
-            user_input = input("you ▸ ").strip()
+            import voice as _voice
+        except Exception as e:      # noqa: BLE001 — fall back to a silent (printed) reply
+            log.warning("voice output unavailable (%s) — replies will be text only", e)
+            _voice = None
+    while True:
+        face.set("listening")
+        try:
+            user_input = input(f"{_BLUE}you ▸ ").strip()   # prompt + typed text in light blue
         except (EOFError, KeyboardInterrupt):
-            print("\nbye.")
+            print(f"{_RESET}\nbye.")
             break
+        sys.stdout.write(_RESET)                            # back to default for Karl's reply
+        sys.stdout.flush()
         if not user_input:
             continue
         if user_input.lower() in {"exit", "quit"}:
             print("bye.")
             break
-        process_turn(messages, user_input, printer=_Printer(label))
+        face.set("thinking")
+        reply = process_turn(messages, user_input, printer=_Printer(label))
+        if _voice and reply:
+            _speak_reply(_voice, reply, face)
+        face.set("idle")
 
 
 def _matches(text: str, options) -> bool:
@@ -975,6 +1118,18 @@ def _voice_summary(full_reply: str) -> str:
         log.debug("voice summary failed (%s) — falling back to truncation", e)
         words = full_reply.split()
         return " ".join(words[:75]) + ("…" if len(words) > 75 else "")
+
+
+def _speak_reply(voice, reply: str, face) -> bool:
+    """Speak a reply aloud, summarizing it to ~30s if it'd otherwise run long, and
+    animate the mouth while talking. Returns True if the user interrupted."""
+    if voice.estimate_seconds(reply) <= config.VOICE_SUMMARY_THRESHOLD_S:
+        spoken = reply
+    else:
+        print("  (long answer — full text above; speaking a ~30s summary)")
+        spoken = _voice_summary(reply)
+    face.set("speaking")
+    return voice.speak_interruptible(spoken)
 
 
 def _get_voice_input(voice, hands_free: bool) -> str:
@@ -1016,8 +1171,9 @@ def _should_rearm(user_input: "str | None", idle_seconds: float, timeout: float)
     return False                             # real speech — stay active
 
 
-def _voice_loop(messages: list[dict], label: str) -> None:
+def _voice_loop(messages: list[dict], label: str, face=None) -> None:
     import voice
+    face = face or _NoFace()
     hands_free = config.VOICE_HANDS_FREE
     timeout = config.VOICE_FOLLOWUP_TIMEOUT
     barge = config.VOICE_INTERRUPT == "voice"
@@ -1033,6 +1189,7 @@ def _voice_loop(messages: list[dict], label: str) -> None:
     active = False  # in an ongoing hands-free conversation (no wake word needed)
     last_active = 0.0  # monotonic time real speech last happened — the idle re-arm clock
     while True:
+        face.set("listening")
         try:
             if not hands_free:
                 user_input = _get_voice_input(voice, hands_free)
@@ -1072,25 +1229,23 @@ def _voice_loop(messages: list[dict], label: str) -> None:
                 continue
             # else: active conversation, no wake word needed — use as-is
 
-        print(f"you ▸ {user_input}")
+        print(f"{_BLUE}you ▸ {user_input}{_RESET}")
         if _matches(user_input, ("exit", "quit", "stop", "goodbye", "goodbye karl", "bye")):
             print("bye.")
             break
 
         # Immediate acknowledgement so she doesn't sit in silence while thinking/searching.
+        face.set("speaking")
         voice.speak_interruptible(random.choice(_THINKING_FILLERS))
 
+        face.set("thinking")
         reply = process_turn(messages, user_input, printer=_Printer(label))
         if not reply:
             continue
 
         # Hard 30-second cap on every spoken response.
-        if voice.estimate_seconds(reply) <= config.VOICE_SUMMARY_THRESHOLD_S:
-            spoken = reply
-        else:
-            print("  (long answer — full text above; speaking a ~30s summary)")
-            spoken = _voice_summary(reply)
-        interrupted = voice.speak_interruptible(spoken)
+        interrupted = _speak_reply(voice, reply, face)
+        face.set("listening")
 
         if interrupted and messages and messages[-1].get("role") == "assistant":
             # Tell the model it was cut off so it adapts to what the user says next.
@@ -1113,6 +1268,7 @@ def main() -> None:
         config.VOICE_INTERRUPT = "voice"
     elif "--speaker" in sys.argv:
         config.VOICE_INTERRUPT = "key"
+    use_face = "--face" in sys.argv or os.environ.get("FACE", "").lower() in {"1", "true", "yes"}
 
     preflight([config.CHAT_MODEL, config.EMBED_MODEL])  # memory needs the embed model too
     try:
@@ -1140,6 +1296,10 @@ def main() -> None:
         mode = f"voice ({'headphone — talk to interrupt' if config.VOICE_INTERRUPT == 'voice' else 'speaker — key to interrupt'})"
     else:
         mode = "text"
+    if use_face:
+        mode += " + animated face"
+        if not use_voice:
+            mode += " (type to Karl — he answers aloud)"
     print(f"Mode: {mode}. Set ASSISTANT_DEBUG=1 to see tool calls.\n")
 
     # Periodic background spam scan (read-only; logs candidates every
@@ -1167,23 +1327,33 @@ def main() -> None:
         spam.set_announcer(_announce)
         spam.start_background_scanner()
         try:
-            blocked = spam.load_autodelete()
+            # Aggregate the notice across every connected account (each has its own lists).
+            accts = spam.connected_accounts()
+            blocked = sum(len(spam.load_autodelete(a)) for a in accts)
+            pending = sum(len(spam.load_candidates(a)) for a in accts)
+            scope = "" if len(accts) <= 1 else f" across {len(accts)} accounts"
             if blocked:
-                print(f"🗑  auto-deleting unread from {len(blocked)} confirmed sender(s) "
+                print(f"🗑  auto-deleting unread from {blocked} confirmed sender(s){scope} "
                       "in the background.")
-            pending = spam.load_candidates()
             if pending:
-                print(f"📬 {len(pending)} sender(s) have over {config.SPAM_UNREAD_THRESHOLD} "
+                print(f"📬 {pending} sender(s){scope} have over {config.SPAM_UNREAD_THRESHOLD} "
                       "unread emails — say \"spam cleanup\" to review.")
             if blocked or pending:
                 print()
         except Exception as e:  # noqa: BLE001
             log.debug("spam notice failed: %s", e)
 
-    if use_voice:
-        _voice_loop(messages, label)
-    else:
-        _text_loop(messages, label)
+    face = _Face() if use_face else _NoFace()
+    if use_face:
+        face.start()
+        face.set("idle")
+    try:
+        if use_voice:
+            _voice_loop(messages, label, face)
+        else:
+            _text_loop(messages, label, face, speak=use_face)  # face ⇒ Karl talks aloud
+    finally:
+        face.stop()
 
 
 if __name__ == "__main__":

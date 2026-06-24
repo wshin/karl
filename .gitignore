@@ -24,11 +24,12 @@ token_*.json
 # Karl's creator-set identity facts (birthday, birthplace)
 karl_self.json
 
-# Spam-scan log + keep / auto-delete lists + resume checkpoint (hold sender addresses)
-spam_candidates.json
-spam_keep.json
-spam_autodelete.json
-spam_scan_state.json
+# Spam-scan log + keep / auto-delete lists + resume checkpoint (hold sender addresses).
+# Glob covers the per-account variants too (spam_candidates_personal.json, …).
+spam_candidates*.json
+spam_keep*.json
+spam_autodelete*.json
+spam_scan_state*.json
 
 # Claude Code local config
 .claude/

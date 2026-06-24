@@ -38,35 +38,52 @@ def _write_json(path: str, data) -> None:
             pass
 
 
-def record_candidates(candidates: list) -> None:
-    """Persist the latest scan result (timestamped) to the log file."""
-    _write_json(config.SPAM_LOG_PATH, {"ts": time.time(), "candidates": candidates})
+# --- per-account state files -------------------------------------------------
+# Each connected account keeps its OWN candidate log, keep-list, auto-delete list, and
+# scan checkpoint, so e.g. a sender you keep in 'personal' is never auto-trashed in
+# 'work'. The PRIMARY account uses the base paths (backward compatible with existing
+# files); every other account gets an '_<account>' suffix before the extension.
+def _primary() -> "str | None":
+    return config.GOOGLE_ACCOUNTS[0] if config.GOOGLE_ACCOUNTS else None
 
 
-def _load() -> dict:
+def _p(base_path: str, account: "str | None") -> str:
+    if not account or account == _primary():
+        return base_path
+    root, ext = os.path.splitext(base_path)
+    return f"{root}_{account}{ext}"
+
+
+def record_candidates(candidates: list, account: str = None) -> None:
+    """Persist the latest scan result (timestamped) to the account's log file."""
+    _write_json(_p(config.SPAM_LOG_PATH, account),
+                {"ts": time.time(), "candidates": candidates})
+
+
+def _load(account: str = None) -> dict:
     try:
-        with open(config.SPAM_LOG_PATH, "r", encoding="utf-8") as f:
+        with open(_p(config.SPAM_LOG_PATH, account), "r", encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
 
 
-def load_keep() -> set:
+def load_keep(account: str = None) -> set:
     """Return the set of kept (never-spam) senders/domains, lowercased."""
     try:
-        with open(config.SPAM_KEEP_PATH, "r", encoding="utf-8") as f:
+        with open(_p(config.SPAM_KEEP_PATH, account), "r", encoding="utf-8") as f:
             return {s.strip().lower() for s in json.load(f) if s.strip()}
     except (OSError, ValueError):
         return set()
 
 
-def add_keep(senders) -> set:
+def add_keep(senders, account: str = None) -> set:
     """Add one or more senders/domains to the keep-list. Returns the new set."""
     if isinstance(senders, str):
         senders = [senders]
-    keep = load_keep()
+    keep = load_keep(account)
     keep.update(s.strip().lower() for s in senders if s and s.strip())
-    _write_json(config.SPAM_KEEP_PATH, sorted(keep))
+    _write_json(_p(config.SPAM_KEEP_PATH, account), sorted(keep))
     return keep
 
 
@@ -87,22 +104,22 @@ def is_kept(sender: str, keep: set = None) -> bool:
     return matches(sender, keep if keep is not None else load_keep())
 
 
-def load_autodelete() -> set:
+def load_autodelete(account: str = None) -> set:
     """Senders/domains the user confirmed as junk — auto-trashed each scan."""
     try:
-        with open(config.SPAM_AUTODELETE_PATH, "r", encoding="utf-8") as f:
+        with open(_p(config.SPAM_AUTODELETE_PATH, account), "r", encoding="utf-8") as f:
             return {s.strip().lower() for s in json.load(f) if s.strip()}
     except (OSError, ValueError):
         return set()
 
 
-def add_autodelete(senders) -> set:
+def add_autodelete(senders, account: str = None) -> set:
     """Add sender(s)/domain(s) to the auto-delete list. Returns the new set."""
     if isinstance(senders, str):
         senders = [senders]
-    block = load_autodelete()
+    block = load_autodelete(account)
     block.update(s.strip().lower() for s in senders if s and s.strip())
-    _write_json(config.SPAM_AUTODELETE_PATH, sorted(block))
+    _write_json(_p(config.SPAM_AUTODELETE_PATH, account), sorted(block))
     return block
 
 
@@ -110,18 +127,18 @@ def is_autodelete(sender: str, block: set = None) -> bool:
     return matches(sender, block if block is not None else load_autodelete())
 
 
-def load_candidates() -> list:
+def load_candidates(account: str = None) -> list:
     """Most recent scan's candidates, with kept and auto-delete senders filtered out
     (so a stale log never resurfaces a sender you've since chosen to keep or auto-delete)."""
-    keep, block = load_keep(), load_autodelete()
-    return [c for c in (_load().get("candidates", []) or [])
+    keep, block = load_keep(account), load_autodelete(account)
+    return [c for c in (_load(account).get("candidates", []) or [])
             if not is_kept(c.get("sender", ""), keep)
             and not is_autodelete(c.get("sender", ""), block)]
 
 
-def last_scan_age() -> "float | None":
+def last_scan_age(account: str = None) -> "float | None":
     """Seconds since the last recorded scan, or None if there's never been one."""
-    ts = _load().get("ts")
+    ts = _load(account).get("ts")
     return (time.time() - ts) if ts else None
 
 
@@ -144,63 +161,78 @@ def announce(msg: str) -> None:
 
 
 # --- resumable scan checkpoint (so a huge scan survives interruption) ----------
-def save_scan_state(state: dict) -> None:
-    _write_json(config.SPAM_SCAN_STATE_PATH, state)
+def save_scan_state(state: dict, account: str = None) -> None:
+    _write_json(_p(config.SPAM_SCAN_STATE_PATH, account), state)
 
 
-def load_scan_state() -> dict:
+def load_scan_state(account: str = None) -> dict:
     try:
-        with open(config.SPAM_SCAN_STATE_PATH, "r", encoding="utf-8") as f:
+        with open(_p(config.SPAM_SCAN_STATE_PATH, account), "r", encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
 
 
-def clear_scan_state() -> None:
+def clear_scan_state(account: str = None) -> None:
     try:
-        os.unlink(config.SPAM_SCAN_STATE_PATH)
+        os.unlink(_p(config.SPAM_SCAN_STATE_PATH, account))
     except OSError:
         pass
 
 
-def run_scan(max_scan: int = None) -> list:
+def connected_accounts() -> list:
+    """Connected Google accounts to scan/clean (primary first); [None] if none, so a
+    single-account setup still works with the base state files."""
+    try:
+        from tools import google_auth
+        return google_auth.available_accounts() or [None]
+    except Exception as e:  # noqa: BLE001
+        log.debug("account discovery failed: %s", e)
+        return [None]
+
+
+def run_scan(max_scan: int = None, account: str = None) -> list:
     """Scan now (live Gmail): auto-trash unread from confirmed auto-delete senders,
     then record the remaining candidates for review. Skips kept + auto-delete senders.
     Pass max_scan=0 to scan the ENTIRE unread history (slower). Returns the candidates."""
     from tools import gmail_tool
-    block = load_autodelete()
+    block = load_autodelete(account)
     auto_n = 0
     if block:
         try:
-            auto_n, _ = gmail_tool.auto_trash_blocked(block)
+            auto_n, _ = gmail_tool.auto_trash_blocked(block, account=account)
         except Exception as e:  # noqa: BLE001
             log.debug("auto-trash failed: %s", e)
-    cands = gmail_tool.find_spam_candidates(max_scan=max_scan, exclude=load_keep() | block)
-    record_candidates(cands)
-    log.info("spam scan: auto-trashed %d, %d sender(s) to review", auto_n, len(cands))
+    cands = gmail_tool.find_spam_candidates(
+        max_scan=max_scan, exclude=load_keep(account) | block, account=account)
+    record_candidates(cands, account)
+    log.info("spam scan [%s]: auto-trashed %d, %d sender(s) to review",
+             account or "primary", auto_n, len(cands))
     return cands
 
 
 def start_background_scanner() -> None:
-    """Start the hourly scanner in a daemon thread (read-only; logs only)."""
+    """Start the periodic scanner in a daemon thread (read-only; logs only). Scans EVERY
+    connected account each cycle."""
     if not (config.GMAIL_ENABLED and config.SPAM_SCAN_ENABLED):
         return
 
     def _loop():
-        # Skip the immediate scan if a recent one already exists (avoids hammering
-        # Gmail when Karl is relaunched often).
+        # Skip the immediate scan if a recent one already exists for the primary (avoids
+        # hammering Gmail when Karl is relaunched often).
         age = last_scan_age()
         if age is not None and age < config.SPAM_SCAN_INTERVAL:
             time.sleep(config.SPAM_SCAN_INTERVAL - age)
         while True:
-            try:
-                run_scan()
-            except Exception as e:  # noqa: BLE001 — never let the scanner crash Karl
-                log.debug("background spam scan failed: %s", e)
+            for acct in connected_accounts():
+                try:
+                    run_scan(account=acct)
+                except Exception as e:  # noqa: BLE001 — never let the scanner crash Karl
+                    log.debug("background spam scan [%s] failed: %s", acct or "primary", e)
             time.sleep(config.SPAM_SCAN_INTERVAL)
 
     threading.Thread(target=_loop, name="spam-scanner", daemon=True).start()
-    log.debug("spam scanner started (every %ds)", config.SPAM_SCAN_INTERVAL)
+    log.debug("spam scanner started (every %ds, all accounts)", config.SPAM_SCAN_INTERVAL)
 
 
 if __name__ == "__main__":

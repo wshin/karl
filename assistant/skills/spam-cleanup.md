@@ -5,6 +5,13 @@ triggers: spam cleanup, deep (email )?(spam )?clean, clean (up )?(my )?(in)?box,
 ---
 When I ask to clean up spam / declutter my inbox:
 
+0. **Which account?** Every spam tool takes an `account` argument.
+   - If I name an account ("clean my **personal** inbox", "spam cleanup on **work**"),
+     pass that as `account`.
+   - If I say **all / every / both accounts**, pass `account="all"` — it runs each
+     connected account in sequence and labels the results per account.
+   - If I don't say, omit `account` (it uses my primary account). Each account keeps its
+     OWN keep-list, auto-delete list, and candidate list, so they never cross over.
 1. Pick the scan:
    - If I say a **DEEP** cleanup (or "scan everything / whole history"), call
      `deep_spam_cleanup`. It scans my entire history, auto-trashes everyone already

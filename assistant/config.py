@@ -153,12 +153,14 @@ SPAM_SCAN_INTERVAL = int(os.environ.get("SPAM_SCAN_INTERVAL", "21600"))  # 6 hou
 SPAM_SCAN_MAX = int(os.environ.get("SPAM_SCAN_MAX", "300"))  # max unread sampled per scan
 SPAM_LOG_PATH = os.path.abspath(os.environ.get(
     "SPAM_LOG_PATH", os.path.join(os.path.dirname(__file__), "..", "spam_candidates.json")))
-# Large mailboxes: when a deep scan would cover more than SPAM_BATCH_THRESHOLD unread,
-# it runs in batches of SPAM_BATCH_SIZE, checkpointing progress to SPAM_SCAN_STATE_PATH
-# after each page so it resumes where it left off if interrupted, and announces after
-# each batch.
-SPAM_BATCH_THRESHOLD = int(os.environ.get("SPAM_BATCH_THRESHOLD", "20000"))
-SPAM_BATCH_SIZE = int(os.environ.get("SPAM_BATCH_SIZE", "2000"))
+# Large mailboxes ("really long" account history): when a deep cleanup would cover more
+# than SPAM_BATCH_THRESHOLD unread, both phases work in batches of SPAM_BATCH_SIZE —
+# the scan checkpoints progress to SPAM_SCAN_STATE_PATH after each Gmail page (so it
+# resumes where it left off if interrupted) and announces after each batch, and the
+# auto-trash phase deletes a batch at a time, announcing the running total. Default
+# batch = 3,000 emails; batching engages once history exceeds SPAM_BATCH_THRESHOLD.
+SPAM_BATCH_THRESHOLD = int(os.environ.get("SPAM_BATCH_THRESHOLD", "10000"))
+SPAM_BATCH_SIZE = int(os.environ.get("SPAM_BATCH_SIZE", "3000"))
 SPAM_SCAN_STATE_PATH = os.path.abspath(os.environ.get(
     "SPAM_SCAN_STATE_PATH", os.path.join(os.path.dirname(__file__), "..", "spam_scan_state.json")))
 # Senders you've marked "keep" — excluded from every scan and cleanup. Holds full
@@ -197,7 +199,12 @@ HISTORY_MAX_MESSAGES = 40    # when history exceeds this, the trim seam kicks in
 AGENT_NAME = os.environ.get("AGENT_NAME", "Karl")
 
 # --- Voice (Phase 5: spoken assistant) ---------------------------------------
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")  # faster-whisper STT model
+# STT model. small.en hears the wake word ("Karl") far more reliably than base.en (which
+# often writes "Carl"/"call"); it's a bit slower to load + transcribe. Set
+# WHISPER_MODEL=base.en to go back to the faster/less-accurate one.
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small.en")  # faster-whisper STT model
+# Bias transcription toward the agent's name so the wake word is heard correctly.
+WHISPER_HOTWORDS = os.environ.get("WHISPER_HOTWORDS", f"Hey {AGENT_NAME}")
 VOICE_SAMPLE_RATE = 16000        # whisper expects 16 kHz mono
 
 # Text-to-speech engine: "auto" uses Piper (neural) if its model is present, else
