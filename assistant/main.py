@@ -16,6 +16,7 @@ import config
 import history
 import self_facts
 import skills
+import typo
 from agent import agent_turn
 from health import preflight
 from memory import store
@@ -804,6 +805,11 @@ def process_turn(messages: list[dict], user_input: str, printer: "_Printer | Non
     the turn errored (already reported). Mutates `messages` (history) in place.
     """
     base_len = len(messages)  # index of this turn's user message / rollback point
+
+    # Conservatively fix obvious typos so the deterministic layers (memory extraction,
+    # intent detectors) and the model read clean input. Names/code/domain terms are
+    # protected, so this won't mangle "Ixtlalli", "Regenics", paths, etc.
+    user_input = typo.correct(user_input)
 
     # The creator setting one of Karl's OWN facts ("you were born on …") → store it as a
     # self-fact (overrides the canned answer) instead of filing it as a fact about the

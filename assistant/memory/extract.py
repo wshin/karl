@@ -81,6 +81,8 @@ def _is_meaningful(fact: str) -> bool:
         return False
     if _JUNK_RE.search(f) or _NON_FACT.search(f):
         return False
+    if _VAGUE_RE.match(f) or re.search(r"(?i)\bdo you think\b", f):  # filler, not a fact
+        return False
     return True
 
 
@@ -118,14 +120,34 @@ _CUE_STRIP = re.compile(
 )
 
 
+# Vague anaphoric references ("all of this", "everything", "it") carry no real fact.
+_VAGUE_RE = re.compile(r"(?i)^(?:all\s+(?:of\s+)?(?:this|that|it)|all\s+that|everything|"
+                       r"this|that|it|the above|the rest|the same)\s*$")
+# Conversational asides to strip from a remembered fact wherever they appear.
+_ASIDE_RE = re.compile(r"(?i)[\s,]*\b(?:do you think|don'?t you think|you know|ya know|"
+                       r"i mean)\b\s*\??")
+# Filler/vague tails to trim off the END ("…, right?", "… ok?", "… all of this").
+_TAIL_RE = re.compile(r"(?i)[\s,]*\b(?:right|ok(?:ay)?|yeah|got it|please|for me|thanks|"
+                      r"all\s+(?:of\s+)?(?:this|that|it)|all\s+that)\b[\s.,?!]*$")
+
+
+def _clean_body(body: str) -> str:
+    """Drop conversational asides and trailing filler from a remember-request."""
+    body = _ASIDE_RE.sub(" ", body)
+    prev = None
+    while prev != body:                      # peel stacked tails ("…, ok, please?")
+        prev = body
+        body = _TAIL_RE.sub("", body).rstrip(" ,.?!:;")
+    return re.sub(r"\s+", " ", body).strip(" ,.?!:;")
+
+
 def remembered_content(text: str) -> list[str]:
     """Deterministically turn an explicit remember-request into a storable fact —
-    strip the cue, normalize pronouns, keep the user's actual content. Reliable
-    where the model's extraction is flaky (it never silently drops details)."""
+    strip the cue and conversational filler, normalize pronouns, keep the user's actual
+    content. Reliable where the model's extraction is flaky (never silently drops details)."""
     is_reminder = bool(re.search(r"(?i)\bremind\b", text))
-    body = _CUE_STRIP.sub(" ", text)
-    body = re.sub(r"\s+", " ", body).strip(" ,.?!:;")
-    if not body:
+    body = _clean_body(_CUE_STRIP.sub(" ", text))
+    if not body or _VAGUE_RE.match(body):    # nothing real to store ("remember all of this")
         return []
     if is_reminder:
         fact = _norm_pronouns("Remind Wontaek to " + body)

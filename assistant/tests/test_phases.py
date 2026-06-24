@@ -1512,3 +1512,35 @@ def test_revision_request_stays_on_previous_answer():
     assert not recalled["hit"]                      # recall skipped → no stray memory
     assert "PREVIOUS answer" in captured["turn"]    # steered to revise the last output
     assert "Cyrus" not in captured["turn"]          # unrelated fact never injected
+
+
+def test_remember_strips_filler_and_rejects_vague():
+    from memory.extract import remembered_content as rc
+    # vague anaphors carry no fact → nothing saved (the "all of this" bug)
+    assert rc("remember all of this") == []
+    assert rc("remember all of it") == []
+    assert rc("note that everything") == []
+    # conversational asides / trailing filler are stripped, the real fact kept clean
+    assert rc("remember that Estefania likes lilies and tulips, do you think?") \
+        == ["Estefania likes lilies and tulips"]
+    assert rc("remember that she likes roses and tulips, right?") == ["She likes roses and tulips"]
+    assert rc("remind me to get Estefania flowers, ok?") == ["Remind Wontaek to get Estefania flowers"]
+    # a clean fact still saves unchanged
+    assert rc("remember that Estefania was born December 30 2000") \
+        == ["Estefania was born December 30 2000"]
+
+
+def test_autocorrect_fixes_typos_but_protects_names_and_code():
+    import config, typo
+    with mock.patch.object(config, "AUTOCORRECT", True):
+        # clearly-misspelled lowercase words get fixed
+        assert typo.correct("recieved teh flowers") == "received the flowers"
+        assert typo.correct("thier favorite") == "their favorite"
+        # PROTECTED: capitalized names, code, emails, paths, keep-list, contractions
+        for s in ["Ixtlalli likes roses", "run qwen3-coder:30b",
+                  "email vendor@regenics.com now", "cd /Users/wontaek/Kara",
+                  "I prefer Kotlin", "she doesn't care"]:
+            assert typo.correct(s) == s, s
+    # disabled → no-op
+    with mock.patch.object(config, "AUTOCORRECT", False):
+        assert typo.correct("recieved teh flowers") == "recieved teh flowers"

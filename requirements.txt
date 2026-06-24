@@ -27,3 +27,6 @@ webrtcvad-wheels>=2.0   # hands-free voice-activity detection
 
 # Dev
 pytest>=8.0
+
+# Conservative typo autocorrect for user input (offline)
+pyspellchecker>=0.8

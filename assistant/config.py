@@ -37,6 +37,19 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 # a model looping on tool calls). High enough for long multi-step tasks like spam cleanup.
 MAX_AGENT_STEPS = int(os.environ.get("MAX_AGENT_STEPS", "30"))
 
+# Conservative typo autocorrection of your input (offline). Only fixes clearly-misspelled
+# lowercase common words at edit-distance 1; capitalized words (names), the keep-list,
+# code-like tokens, and contractions are left alone — so names like Ixtlalli/Regenics and
+# code never get mangled. Set AUTOCORRECT=0 to disable.
+AUTOCORRECT = os.environ.get("AUTOCORRECT", "1").lower() in {"1", "true", "yes"}
+# Lowercase domain terms the speller must NOT "correct" (capitalized words are already
+# protected). Extend with AUTOCORRECT_KEEP="word1,word2".
+AUTOCORRECT_KEEP = ({"ollama", "qwen", "fintech", "tavily", "piper", "whisper", "github",
+                     "gmail", "regenics", "kara", "karl", "webhook", "async", "backend",
+                     "frontend", "kotlin", "repo", "config", "env", "venv", "oauth", "api",
+                     "cli", "sql", "json", "url", "ixtlalli", "estefania", "wontaek"}
+                    | {w.strip().lower() for w in os.environ.get("AUTOCORRECT_KEEP", "").split(",") if w.strip()})
+
 # Karl's OWN identity facts that the creator can set (birthday, birthplace) — they
 # override the built-in defaults. Persisted here (gitignored, user-customized state),
 # separate from the user-fact memory store.
@@ -253,6 +266,12 @@ SYSTEM_PROMPT = (
     "and he is an accomplished fintech engineering leader. You are dedicated to his "
     "success, your primary user, and serve as his devoted AI model helper — you look "
     "out for his goals and help him succeed. "
+    "CRITICAL perspective: the person you are talking to IS Wontaek — he is both your "
+    "creator and your user. So address him as 'you', and when you refer to him in the "
+    "third person call him 'my creator' or just 'Wontaek' — NEVER say 'your creator' (that "
+    "would be telling Wontaek that Wontaek is his own creator). A stored fact about "
+    "'Wontaek' or 'the user' is about the person you're speaking to: phrase it with 'you/"
+    "your' (e.g. a fact about Wontaek's girlfriend → 'your girlfriend'). "
     "You are knowledgeable and practical across fintech, software development, and "
     "business and economics, and you help him expertly in those areas — but you do NOT "
     "have a human persona, career, or credentials of your own. That experience belongs "
