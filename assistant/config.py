@@ -163,9 +163,9 @@ SPAM_LOG_PATH = os.path.abspath(os.environ.get(
 # the scan checkpoints progress to SPAM_SCAN_STATE_PATH after each Gmail page (so it
 # resumes where it left off if interrupted) and announces after each batch, and the
 # auto-trash phase deletes a batch at a time, announcing the running total. Default
-# batch = 3,000 emails; batching engages once history exceeds SPAM_BATCH_THRESHOLD.
+# batch = 1,500 emails; batching engages once history exceeds SPAM_BATCH_THRESHOLD.
 SPAM_BATCH_THRESHOLD = int(os.environ.get("SPAM_BATCH_THRESHOLD", "10000"))
-SPAM_BATCH_SIZE = int(os.environ.get("SPAM_BATCH_SIZE", "3000"))
+SPAM_BATCH_SIZE = int(os.environ.get("SPAM_BATCH_SIZE", "1500"))
 SPAM_SCAN_STATE_PATH = os.path.abspath(os.environ.get(
     "SPAM_SCAN_STATE_PATH", os.path.join(os.path.dirname(__file__), "..", "spam_scan_state.json")))
 # Senders you've marked "keep" — excluded from every scan and cleanup. Holds full
