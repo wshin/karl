@@ -990,9 +990,9 @@ def test_identity_questions_get_fixed_answer():
     for ans in main._IDENTITY_ANSWERS:
         for token in ("Python", "Gemma", "Qwen3", "DeepSeek"):
             assert token in ans, (token, ans)
-    # ...but on general "what are you" answers, Wontaek Shin is in only some, not all
-    credited = [a for a in main._IDENTITY_ANSWERS if "Wontaek Shin" in a]
-    assert 0 < len(credited) < len(main._IDENTITY_ANSWERS)
+    # ...and a general "what are you" answer NEVER names the creator: that's a separate,
+    # explicitly-asked question, so Karl doesn't volunteer who made it (less is more).
+    assert not any("Wontaek" in a for a in main._IDENTITY_ANSWERS)
 
 
 def test_creator_questions_always_credit_wontaek():
@@ -1007,9 +1007,10 @@ def test_creator_questions_always_credit_wontaek():
     for q in ["what are you", "what are you made of", "who are you", "what llm are you",
               "what are you doing", "who are you meeting today"]:
         assert not main._is_creator_question(q), q
-    # EVERY creator answer names Wontaek Shin, and there are a few to rotate
+    # EVERY creator answer names Wontaek Shin, but SPARSELY — a short line, no biography
     assert len(main._CREATOR_ANSWERS) >= 2
     assert all("Wontaek Shin" in a for a in main._CREATOR_ANSWERS)
+    assert all(len(a) <= 60 for a in main._CREATOR_ANSWERS)   # sparse, not a spiel
     # process_turn routes a creator question to a Wontaek-crediting answer
     msgs = [{"role": "system", "content": "sys"}]
     reply = main.process_turn(msgs, "who made you?")

@@ -158,8 +158,9 @@ def _is_conversation_recap(text: str) -> bool:
 # Identity / origin / "what are you made of" questions get a fixed, accurate answer
 # (qwen otherwise improvises — claims to be a single model, or a person). Detected in
 # code so the answer is consistent every time, not left to the model. Two buckets:
-# CREATOR questions ("who made/built you", "who's your creator") ALWAYS credit Wontaek
-# Shin; the rest are general identity/tech questions whose phrasing varies.
+# CREATOR questions ("who made/built you") name Wontaek Shin but SPARSELY — a single
+# short line, no unprompted biography; the rest are general identity/tech questions that
+# describe what Karl is WITHOUT volunteering the creator (less is more — see SYSTEM_PROMPT).
 _CREATOR = re.compile(
     r"(?i)("
     r"\bwho\s+(?:made|created|built|design(?:ed)?|wrote|coded|programmed|develop(?:ed)?|"
@@ -185,38 +186,30 @@ _IDENTITY = re.compile(
     r"|\bare\s+you\s+(?:an?\s+)?(?:ai|a\.?i\.?|llm|gpt|chat\s?gpt|claude|gemini|language\s+model)\b"
     r")")
 
-# General identity/tech answers — varied phrasing; only some credit Wontaek Shin, so he
-# isn't named every single time on a "what are you" question.
+# General identity/tech answers — describe what Karl IS (the tech), WITHOUT naming the
+# creator: "what are you" isn't a question about who made it, so don't volunteer that.
 _IDENTITY_ANSWERS = (
-    "I'm primarily Python code that provides the infrastructure and represents agents that "
-    "access a blend of stateless, open-source LLMs — like Gemma, Qwen3, and DeepSeek. The "
-    "tooling around voice, skills, context, conversation, and memory was put together by "
-    "Wontaek Shin.",
-    "At my core I'm Python — infrastructure that wires together agents running on a mix of "
-    "stateless, open-source models like Qwen3, Gemma, and DeepSeek, with layers for voice, "
-    "skills, memory, context, and conversation built around them.",
-    "Mostly Python code. I represent agents that draw on several stateless open-source LLMs "
-    "— Gemma, Qwen3, and DeepSeek — wrapped in tooling for voice, skills, context, "
-    "conversation, and memory.",
+    "I'm primarily Python code — infrastructure that represents agents drawing on a blend of "
+    "stateless, open-source LLMs like Gemma, Qwen3, and DeepSeek, wrapped in tooling for "
+    "voice, skills, context, conversation, and memory.",
+    "At my core I'm Python that wires together agents running on a mix of stateless, "
+    "open-source models like Qwen3, Gemma, and DeepSeek, with layers for voice, skills, "
+    "memory, context, and conversation around them.",
+    "Mostly Python code, representing agents that draw on several stateless open-source LLMs "
+    "— Gemma, Qwen3, and DeepSeek — with tooling for voice, skills, context, conversation, "
+    "and memory.",
     "Think of me as Python infrastructure in front of a blend of open-source, stateless "
-    "language models — Qwen3, Gemma, DeepSeek. The voice, memory, skills, context, and "
-    "conversation tooling around them is Wontaek Shin's work.",
-    "I'm built mostly in Python — the scaffolding that lets agents tap a blend of stateless, "
-    "open-source LLMs such as Gemma, Qwen3, and DeepSeek, with everything around them — "
-    "voice, skills, context, conversation, memory — layered on top.",
+    "language models — Qwen3, Gemma, DeepSeek — with voice, memory, skills, context, and "
+    "conversation layered on top.",
 )
 
-# Creator answers — varied phrasing, but EVERY one names Wontaek Shin as the maker.
+# Creator answers — SPARSE: name Wontaek Shin and stop. Details (his background, the tech)
+# come only if the user follows up, handled by the model per the SYSTEM_PROMPT.
 _CREATOR_ANSWERS = (
-    "Wontaek Shin made me — he designed and built me: Python infrastructure wired around a "
-    "blend of stateless, open-source LLMs like Gemma, Qwen3, and DeepSeek, plus the tooling "
-    "for voice, skills, context, conversation, and memory.",
-    "I was created by Wontaek Shin. He put together the Python infrastructure and all the "
-    "surrounding tooling — voice, skills, memory, context, conversation — on top of a mix of "
-    "open-source models like Qwen3, Gemma, and DeepSeek.",
-    "That's Wontaek Shin — he designed and assembled me, from the Python core to the voice, "
-    "skills, memory, and conversation layers, over a blend of stateless open-source LLMs "
-    "such as Gemma, Qwen3, and DeepSeek.",
+    "Wontaek Shin built me.",
+    "I was made by Wontaek Shin.",
+    "My creator is Wontaek Shin.",
+    "That'd be Wontaek Shin.",
 )
 
 
@@ -238,11 +231,9 @@ _AGE = re.compile(
 
 _AGE_ANSWERS = (
     f"I don't have a birth date the way people do, but I was 'born' in {_AI_BIRTHPLACE}, "
-    "where Wontaek Shin built me.",
-    f"No real birthday — I'm software — though you could say I came to life in {_AI_BIRTHPLACE}, "
-    "courtesy of my creator, Wontaek Shin.",
-    f"I wasn't born on a date, but my origin is {_AI_BIRTHPLACE}, where Wontaek Shin put me "
-    "together.",
+    "where I was built.",
+    f"No real birthday — I'm software — though you could say I came to life in {_AI_BIRTHPLACE}.",
+    f"I wasn't born on a date, but my origin is {_AI_BIRTHPLACE}.",
 )
 
 # "Where were you born / where are you from" → Karl's birthplace (Reno).
@@ -254,8 +245,8 @@ _BIRTHPLACE_YOU = re.compile(
     r")")
 
 _BIRTHPLACE_YOU_ANSWERS = (
-    f"I was born in {_AI_BIRTHPLACE} — that's where Wontaek Shin built me.",
-    f"{_AI_BIRTHPLACE} is my birthplace; that's where my creator, Wontaek Shin, put me together.",
+    f"I was born in {_AI_BIRTHPLACE} — that's where I was built.",
+    f"{_AI_BIRTHPLACE} is my birthplace.",
     f"I come from {_AI_BIRTHPLACE}, where I was first built.",
 )
 
@@ -270,9 +261,9 @@ _CREATOR_ORIGIN = re.compile(
     r")")
 
 _CREATOR_ORIGIN_ANSWERS = (
-    f"My creator, Wontaek Shin, was born in {_CREATOR_BIRTHPLACE}.",
-    f"Wontaek Shin — the person who made me — was born in {_CREATOR_BIRTHPLACE}.",
-    f"That's Wontaek Shin; he was born in {_CREATOR_BIRTHPLACE}.",
+    f"{_CREATOR_BIRTHPLACE}.",
+    f"He was born in {_CREATOR_BIRTHPLACE}.",
+    f"Wontaek Shin was born in {_CREATOR_BIRTHPLACE}.",
 )
 
 
@@ -297,8 +288,8 @@ def _age_answer() -> str:
 def _birthplace_answer() -> str:
     place = self_facts.get("birthplace") or _AI_BIRTHPLACE
     return random.choice((
-        f"I was born in {place} — that's where Wontaek Shin built me.",
-        f"{place} is my birthplace; that's where my creator, Wontaek Shin, put me together.",
+        f"I was born in {place} — that's where I was built.",
+        f"{place} is my birthplace.",
         f"I come from {place}, where I was first built."))
 
 
