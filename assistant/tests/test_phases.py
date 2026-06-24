@@ -1689,3 +1689,34 @@ def test_account_custom_labels():
             # the other account was never labeled
             assert "doesn't have a custom label" in accounts.clear_account_label("work")
     config.GOOGLE_ACCOUNTS = []
+
+
+def test_connect_account_without_label():
+    """Connecting a new account needs no label — it's keyed/identified by its email."""
+    import os as _os, tempfile, glob
+    import config
+    from tools import google_auth as ga
+    config.GOOGLE_ACCOUNTS = ["work", "personal"]
+    with tempfile.TemporaryDirectory() as d:
+        config.GOOGLE_TOKEN_PATH = _os.path.join(d, "token.json")
+        open(config.GOOGLE_TOKEN_PATH, "w").write("{}")        # primary already connected
+
+        def fake_creds(account, interactive=False):
+            open(ga._token_path(account), "w").write("{}")     # the "browser" writes the token
+            return object()
+
+        keymail = {"work": "wontaek@regenics.com", "_pending": "jane@gmail.com", "jane": "jane@gmail.com"}
+        with mock.patch.object(ga, "_credentials", fake_creds), \
+                mock.patch.object(ga, "account_email", lambda a: keymail.get(a)):
+            key, email = ga.authorize_new(interactive=True)
+            assert key == "jane" and email == "jane@gmail.com"          # keyed off the email
+            assert _os.path.exists(_os.path.join(d, "token_jane.json"))
+            assert not _os.path.exists(_os.path.join(d, "token__pending.json"))  # temp cleaned up
+            assert "jane" in ga.available_accounts()
+            # reconnecting an already-connected email reuses its key (no duplicate token)
+            keymail["_pending"] = "wontaek@regenics.com"
+            key2, _ = ga.authorize_new(interactive=True)
+            assert key2 == "work"
+            assert sorted(_os.path.basename(p) for p in glob.glob(_os.path.join(d, "token*.json"))) \
+                == ["token.json", "token_jane.json"]
+    config.GOOGLE_ACCOUNTS = []

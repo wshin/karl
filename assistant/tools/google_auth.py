@@ -48,7 +48,8 @@ def available_accounts() -> list:
     try:
         for fn in sorted(os.listdir(os.path.dirname(config.GOOGLE_TOKEN_PATH))):
             m = re.match(r"token_(.+)\.json$", fn)
-            if m and m.group(1) != primary_account():
+            # skip internal/temp keys (e.g. the "_pending" token used mid-connect)
+            if m and m.group(1) != primary_account() and not m.group(1).startswith("_"):
                 accts.append(m.group(1))
     except OSError:
         pass
@@ -58,6 +59,62 @@ def available_accounts() -> list:
 def authorize(account: str):
     """Run the OAuth flow for `account` (opens a browser if it isn't already connected)."""
     return _credentials(account, interactive=True)
+
+
+def _stable_key_from_email(email: str, taken: set) -> str:
+    """A filename-safe internal key derived from an email (e.g. wontaek@gmail.com ->
+    'wontaek'), made unique against the already-connected keys in `taken`."""
+    email = (email or "").lower()
+    base = re.sub(r"[^a-z0-9]+", "", email.partition("@")[0]) or "account"
+    if base not in taken:
+        return base
+    dom = re.sub(r"[^a-z0-9]+", "", email.partition("@")[2].split(".")[0])
+    cand = f"{base}{dom}" if dom and f"{base}{dom}" not in taken else base
+    i = 2
+    while cand in taken:
+        cand, i = f"{base}{i}", i + 1
+    return cand
+
+
+def authorize_new(interactive: bool = True) -> tuple:
+    """Connect a brand-new account WITHOUT a user-supplied label: run OAuth into a temp
+    token, read the account's email, then settle the token under a stable key derived
+    from that email. If the email is already connected, reuse it. Returns (key, email)."""
+    existing = available_accounts()
+    tmp = "_pending"
+    tmp_path = _token_path(tmp)
+    if os.path.exists(tmp_path):
+        try:
+            os.unlink(tmp_path)               # never reuse a stale pending token
+        except OSError:
+            pass
+    try:
+        _credentials(tmp, interactive=interactive)        # browser consent
+        _email_cache.pop(tmp, None)                        # force a fresh lookup for this token
+        email = account_email(tmp)
+    except Exception:
+        try:
+            os.path.exists(tmp_path) and os.unlink(tmp_path)
+        except OSError:
+            pass
+        _services.pop(("gmail", "v1", tmp), None)
+        _email_cache.pop(tmp, None)
+        raise
+    # already connected under another key? reuse it, drop the temp token.
+    for a in existing:
+        em = account_email(a)
+        if em and email and em.lower() == email.lower():
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            _services.pop(("gmail", "v1", tmp), None)
+            return a, email
+    key = _stable_key_from_email(email, {a.lower() for a in existing} | {primary_account()})
+    os.replace(tmp_path, _token_path(key))
+    _services.clear()                         # temp-keyed clients are now stale
+    _email_cache.clear()
+    return key, email
 
 
 _email_cache: dict = {}  # label -> email address (network lookup is cached)

@@ -56,13 +56,13 @@ def clear_account_label(account: str) -> str:
     return f"Removed the \"{had}\" label — I'll refer to {email or account} by its email now."
 
 
-def connect_google_account(account: str) -> str:
+def connect_google_account(account: str = None) -> str:
     """Connect a Google account by running the OAuth flow (opens a browser). Call this
-    only once the user is ready, since it opens a browser they must complete."""
+    only once the user is ready, since it opens a browser they must complete. `account`
+    (a label) is OPTIONAL — omit it to just connect and identify the account by its email
+    address; only pass it if the user explicitly wants a custom name for it."""
     from . import google_auth
     account = (account or "").strip().lower()
-    if not account:
-        return "Tell me a short label for the account (e.g. 'personal' or 'work')."
     if not os.path.exists(config.GOOGLE_CREDENTIALS_PATH):
         return (
             "First-time Google setup is needed. This credentials.json is created ONCE and "
@@ -80,6 +80,16 @@ def connect_google_account(account: str) -> str:
             "- Business/Workspace Gmail: your IT admin may block third-party apps — if it "
             "won't connect, ask them to allow it, or have a Workspace admin create the OAuth "
             "app as 'Internal'.")
+    # No label given — connect and identify the account by its email (the common case).
+    if not account:
+        try:
+            _key, email = google_auth.authorize_new()  # browser flow; derives a key from the email
+        except Exception as e:  # noqa: BLE001
+            return f"Couldn't connect the account: {e}"
+        return (f"Connected {email or 'the account'} — it's now included in your email and "
+                "calendar. I'll refer to it by its email; just say so if you'd like to give "
+                "it a label.")
+    # Explicit label requested.
     if account in google_auth.available_accounts():
         email = google_auth.account_email(account) or ""
         return f"'{account}'{f' ({email})' if email else ''} is already connected."
@@ -110,11 +120,14 @@ CONNECT_ACCOUNT_SCHEMA = {
         "description": "Connect a new Google account by opening the OAuth browser flow. The "
                        "user signs in with that account and approves. Call this ONLY after "
                        "confirming the user is ready (it opens a browser they must complete). "
-                       "If first-time setup is missing it returns the steps to relay.",
+                       "Do NOT ask the user for a label — just call it with no arguments and "
+                       "the account is identified by its email address. Only pass `account` if "
+                       "the user explicitly volunteers a custom name. If first-time setup is "
+                       "missing it returns the steps to relay.",
         "parameters": {
             "type": "object",
-            "properties": {"account": {"type": "string", "description": "A short label for the account, e.g. 'personal' or 'work'."}},
-            "required": ["account"],
+            "properties": {"account": {"type": "string", "description": "OPTIONAL custom label. Omit unless the user explicitly asks to name the account; by default the account is identified by its email."}},
+            "required": [],
         },
     },
 }
