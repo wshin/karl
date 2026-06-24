@@ -60,20 +60,56 @@ def authorize(account: str):
     return _credentials(account, interactive=True)
 
 
+_email_cache: dict = {}  # label -> email address (network lookup is cached)
+
+
 def account_email(account: str) -> "str | None":
     """The email address of a connected account (via Gmail getProfile), or None."""
+    key = account or primary_account()
+    if key in _email_cache:
+        return _email_cache[key]
     try:
-        return service("gmail", "v1", account).users().getProfile(
+        email = service("gmail", "v1", account).users().getProfile(
             userId="me").execute().get("emailAddress")
     except Exception as e:  # noqa: BLE001
         log.debug("account_email(%s) failed: %s", account, e)
-        return None
+        email = None
+    _email_cache[key] = email
+    return email
+
+
+def account_map() -> dict:
+    """{label: email} for every connected account (emails cached after first lookup)."""
+    return {a: account_email(a) for a in available_accounts()}
+
+
+def resolve_account(value: "str | None") -> "str | None":
+    """Map a user-facing account identifier — a short label OR a full email address
+    (case-insensitive) — to the internal label used for token/state files. None and the
+    'all' sentinel pass through unchanged; an unknown value is returned as-is so the
+    caller surfaces a clear 'not connected' error."""
+    if not value:
+        return value
+    v = value.strip()
+    if v.lower() in {"all", "every", "everything", "both"}:
+        return v
+    avail = available_accounts()
+    for a in avail:                                   # already a known label?
+        if a and a.lower() == v.lower():
+            return a
+    if "@" in v:                                      # an email address — find its label
+        for a in avail:
+            em = account_email(a)
+            if em and em.lower() == v.lower():
+                return a
+    return value
 
 
 def accounts_for(account: "str | None") -> list:
     """Resolve a request's account arg: None/'all' -> every authorized account; a
-    specific label -> just that one (if authorized, else empty)."""
+    specific label OR email address -> just that one (if authorized, else empty)."""
     if account and account.lower() != "all":
+        account = resolve_account(account)            # accept an email or a label
         return [account] if os.path.exists(_token_path(account)) else []
     return available_accounts()
 
@@ -134,7 +170,7 @@ def _credentials(account: str, interactive: bool = False):
 def service(api: str, version: str, account: "str | None" = None):
     """Authenticated Google API client for an account (defaults to the primary). Never
     opens a browser — raises if the account isn't connected."""
-    account = account or primary_account()
+    account = resolve_account(account) or primary_account()  # accept a label or an email
     key = (api, version, account)
     if key not in _services:
         from googleapiclient.discovery import build

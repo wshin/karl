@@ -1626,7 +1626,8 @@ def test_spam_cleanup_all_runs_every_account():
     importlib.reload(spam)
     from tools import gmail_tool
     with mock.patch.object(gmail_tool, "_deep_spam_cleanup_one", lambda a: f"done:{a}"), \
-            mock.patch("tools.google_auth.available_accounts", lambda: ["work", "personal"]):
+            mock.patch("tools.google_auth.available_accounts", lambda: ["work", "personal"]), \
+            mock.patch("tools.google_auth.account_email", lambda a: None):  # header -> label
         out = gmail_tool.deep_spam_cleanup("all")
         assert "=== work ===" in out and "done:work" in out
         assert "=== personal ===" in out and "done:personal" in out
@@ -1634,3 +1635,25 @@ def test_spam_cleanup_all_runs_every_account():
         assert gmail_tool.deep_spam_cleanup("work") == "done:work"
     config.GOOGLE_ACCOUNTS = []
     importlib.reload(spam)
+
+
+def test_account_resolution_by_email():
+    """Accounts are addressable by email address, not just internal labels."""
+    import config
+    from tools import google_auth as ga, gmail_tool as g
+    config.GOOGLE_ACCOUNTS = ["work", "personal"]
+    emails = {"work": "wontaek@regenics.com", "personal": "wontaek@gmail.com"}
+    with mock.patch.object(ga, "available_accounts", lambda: ["work", "personal"]), \
+            mock.patch.object(ga, "account_email", lambda a: emails.get(a)):
+        # email (any case) -> internal label
+        assert ga.resolve_account("wontaek@gmail.com") == "personal"
+        assert ga.resolve_account("WONTAEK@GMAIL.COM") == "personal"
+        # label stays a label; sentinels/unknowns pass through
+        assert ga.resolve_account("work") == "work"
+        assert ga.resolve_account("all") == "all"
+        assert ga.resolve_account(None) is None
+        assert ga.resolve_account("ghost@x.com") == "ghost@x.com"
+        # spam tools accept an email and map it to the label; headers show the email
+        assert g._accounts_for("wontaek@gmail.com") == ["personal"]
+        assert g._acct_header("work") == "wontaek@regenics.com"
+    config.GOOGLE_ACCOUNTS = []

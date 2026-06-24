@@ -243,13 +243,21 @@ def _count_unread(svc, query: str, cap: int = 5000) -> int:
 
 
 def _accounts_for(account: "str | None") -> list:
-    """Resolve a tool's `account` arg to the concrete account(s) to act on. 'all' (or
-    'every'/'both') expands to every connected account; anything else is used as-is
-    (None = the primary account)."""
+    """Resolve a tool's `account` arg to the concrete account label(s) to act on. 'all'
+    (or 'every'/'both') expands to every connected account; an email address or label is
+    normalized to its internal label (None = the primary account)."""
+    from . import google_auth
     if account and account.strip().lower() in {"all", "every", "everything", "both"}:
-        from . import google_auth
         return google_auth.available_accounts() or [None]
-    return [account]
+    return [google_auth.resolve_account(account) if account else account]
+
+
+def _acct_header(account: "str | None") -> str:
+    """Label an account section by its email address when we can get it, else its label."""
+    from . import google_auth
+    if not account:
+        return google_auth.account_email(None) or "primary"
+    return google_auth.account_email(account) or account
 
 
 def find_spam_candidates(threshold: int = None, max_scan: int = None, exclude=None,
@@ -314,7 +322,7 @@ def find_spam_candidates_text(threshold: int = None, full: bool = False,
     auto-delete senders are excluded; results are numbered."""
     accts = _accounts_for(account)
     if len(accts) > 1:
-        return "\n\n".join(f"=== {a or 'primary'} ===\n"
+        return "\n\n".join(f"=== {_acct_header(a)} ===\n"
                            + find_spam_candidates_text(threshold, full, a) for a in accts)
     account = accts[0]
     try:
@@ -449,6 +457,8 @@ def auto_trash_blocked(senders, account: str = None) -> "tuple[int, dict]":
 def auto_delete_sender(sender: str, account: str = None) -> str:
     """Add a sender to the auto-delete list and clear their current unread now."""
     import spam
+    from . import google_auth
+    account = google_auth.resolve_account(account)   # accept an email or a label
     spam.add_autodelete(sender, account)
     try:
         svc = _service(account)
@@ -464,6 +474,8 @@ def auto_delete_sender(sender: str, account: str = None) -> str:
 def keep_sender(sender: str, account: str = None) -> str:
     """Mark a sender (address or domain) as 'keep' so spam cleanup never flags it."""
     import spam
+    from . import google_auth
+    account = google_auth.resolve_account(account)   # accept an email or a label
     spam.add_keep(sender, account)
     return f"Added {sender} to the keep-list — it won't be flagged as spam again."
 
@@ -479,7 +491,7 @@ KEEP_SENDER_SCHEMA = {
             "type": "object",
             "properties": {
                 "sender": {"type": "string", "description": "Email address (team@x.com) or domain (x.com)."},
-                "account": {"type": "string", "description": "Which connected account this applies to (e.g. 'work', 'personal'). Omit for the primary account."},
+                "account": {"type": "string", "description": "Which connected account this applies to (a label like 'personal', or the account's email address). Omit for the primary account."},
             },
             "required": ["sender"],
         },
@@ -552,7 +564,7 @@ def deep_spam_cleanup(account: str = None) -> str:
     keep lists and candidate review list."""
     accts = _accounts_for(account)
     if len(accts) > 1:
-        return "\n\n".join(f"=== {a or 'primary'} ===\n" + _deep_spam_cleanup_one(a)
+        return "\n\n".join(f"=== {_acct_header(a)} ===\n" + _deep_spam_cleanup_one(a)
                            for a in accts)
     return _deep_spam_cleanup_one(accts[0])
 
@@ -622,7 +634,7 @@ DEEP_CLEANUP_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "account": {"type": "string", "description": "Which connected account to clean (e.g. 'work', 'personal'). Omit for the primary account, or pass 'all' to clean EVERY connected account in sequence."},
+                "account": {"type": "string", "description": "Which connected account to clean (a label like 'personal', or the account's email address). Omit for the primary account, or pass 'all' to clean EVERY connected account in sequence."},
             },
             "required": [],
         },
@@ -642,7 +654,7 @@ AUTO_DELETE_SENDER_SCHEMA = {
             "type": "object",
             "properties": {
                 "sender": {"type": "string", "description": "Email address (x@y.com) or domain (y.com)."},
-                "account": {"type": "string", "description": "Which connected account this applies to (e.g. 'work', 'personal'). Omit for the primary account."},
+                "account": {"type": "string", "description": "Which connected account this applies to (a label like 'personal', or the account's email address). Omit for the primary account."},
             },
             "required": ["sender"],
         },
@@ -663,7 +675,7 @@ FIND_SPAM_SCHEMA = {
             "properties": {
                 "threshold": {"type": "integer", "description": "Min unread from one sender to flag (default 10)."},
                 "full": {"type": "boolean", "description": "Scan the entire unread history instead of a sample (deeper, slower)."},
-                "account": {"type": "string", "description": "Which connected account to scan (e.g. 'work', 'personal'). Omit for the primary account, or pass 'all' for every connected account."},
+                "account": {"type": "string", "description": "Which connected account to scan (a label like 'personal', or the account's email address). Omit for the primary account, or pass 'all' for every connected account."},
             },
             "required": [],
         },
@@ -681,7 +693,7 @@ TRASH_FROM_SENDER_SCHEMA = {
             "type": "object",
             "properties": {
                 "sender": {"type": "string", "description": "The sender's email address."},
-                "account": {"type": "string", "description": "Which connected account this applies to (e.g. 'work', 'personal'). Omit for the primary account."},
+                "account": {"type": "string", "description": "Which connected account this applies to (a label like 'personal', or the account's email address). Omit for the primary account."},
             },
             "required": ["sender"],
         },
@@ -701,7 +713,7 @@ LIST_MESSAGES_SCHEMA = {
                 "query": {"type": "string", "description": "Gmail search query (optional)."},
                 "max_results": {"type": "integer", "description": "Max messages per account (default 10)."},
                 "unread_only": {"type": "boolean", "description": "Only unread messages."},
-                "account": {"type": "string", "description": "Which account (e.g. 'work', 'personal'). Omit to search ALL connected accounts."},
+                "account": {"type": "string", "description": "Which account (a label like 'personal', or the account's email address). Omit to search ALL connected accounts."},
             },
             "required": [],
         },
@@ -735,7 +747,7 @@ SEND_MESSAGE_SCHEMA = {
                 "subject": {"type": "string", "description": "Subject line."},
                 "body": {"type": "string", "description": "Plain-text email body."},
                 "cc": {"type": "string", "description": "CC address(es), optional."},
-                "account": {"type": "string", "description": "Which account to send FROM (e.g. 'work', 'personal'). Default: primary."},
+                "account": {"type": "string", "description": "Which account to send FROM (a label like 'personal', or the account's email address). Default: primary."},
             },
             "required": ["to", "subject", "body"],
         },
