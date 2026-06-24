@@ -1729,3 +1729,45 @@ def test_connect_account_without_label():
             assert sorted(_os.path.basename(p) for p in glob.glob(_os.path.join(d, "token*.json"))) \
                 == ["token.json", "token_jane.json"]
     config.GOOGLE_ACCOUNTS = []
+
+
+def test_approval_menu_typed_fallback():
+    """Off a real TTY (tests, pipes), the approval menu falls back to a typed prompt
+    and still maps keys/words to the right decision."""
+    import main, approval
+    approval.reset()
+    with mock.patch("sys.stdin") as si, mock.patch("builtins.input", lambda *a: "p"):
+        si.isatty.return_value = False
+        ok, _ = main._approve_command("./gradlew clean build")
+        assert ok and approval.is_approved("./gradlew test")[0]   # prefix approval stuck
+    approval.reset()
+    with mock.patch("sys.stdin") as si, mock.patch("builtins.input", lambda *a: "n"):
+        si.isatty.return_value = False
+        assert main._approve_command("rm -rf /")[0] is False
+    with mock.patch("sys.stdin") as si, mock.patch("builtins.input", lambda *a: "yes"):
+        si.isatty.return_value = False
+        assert main._confirm_action("Send email?") is True
+    # _choose maps both key letters and full words, else None
+    with mock.patch("sys.stdin") as si, mock.patch("builtins.input", lambda *a: "huh"):
+        si.isatty.return_value = False
+        assert main._choose(["pick:"], [("y", "yes"), ("n", "no")]) is None
+    approval.reset()
+
+
+def test_interrupt_thinking_discards_partial_turn():
+    """Ctrl-C while Karl is thinking cancels the turn and returns to the prompt (it does
+    NOT quit), leaving conversation history consistent."""
+    import main
+    msgs = [{"role": "system", "content": "s"},
+            {"role": "user", "content": "old"}, {"role": "assistant", "content": "prev"}]
+
+    def boom(messages, user_input, printer=None):
+        messages.append({"role": "user", "content": user_input})   # partial turn
+        raise KeyboardInterrupt
+
+    inputs = iter(["build the project", "exit"])
+    with mock.patch.object(main, "process_turn", boom), \
+            mock.patch("builtins.input", lambda *a: next(inputs)):
+        main._text_loop(msgs, "karl")          # returns (didn't crash out) after 'exit'
+    assert len(msgs) == 3                        # partial turn discarded
+    assert msgs[-1] == {"role": "assistant", "content": "prev"}

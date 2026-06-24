@@ -30,6 +30,7 @@ log = logging.getLogger("assistant.main")
 _COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
 _BLUE = "\033[38;5;117m" if _COLOR else ""   # light blue — the user's prompt + input
 _DIM = "\033[2m" if _COLOR else ""
+_SEL = "\033[1;38;5;39m" if _COLOR else ""   # bold blue — highlighted menu selection
 _RESET = "\033[0m" if _COLOR else ""
 
 
@@ -742,26 +743,92 @@ def _force_search_answer(messages: list[dict], user_input: str, printer: "_Print
         return None
 
 
+def _arrow_menu(header_lines: list, options: list):
+    """Render an arrow-key-selectable menu (↑/↓ or ←/→ to move, Enter to pick; letter
+    hotkeys still work; Esc/Ctrl-C cancels). `options` = [(key, label), …]. Returns the
+    chosen key, or None if cancelled. Raises if the terminal can't do raw input — the
+    caller falls back to a typed prompt."""
+    import termios, tty, select as _select
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)                      # raises on a non-tty → caller falls back
+    for line in header_lines:
+        print(line)
+    print(f"  {_DIM}↑/↓ to move · Enter to select · Esc to cancel{_RESET}")
+    sel, n = 0, len(options)
+    keys = {k for k, _ in options}
+
+    def draw(first=False):
+        if not first:
+            sys.stdout.write(f"\x1b[{n}A")          # move cursor back up over the menu
+        for i, (k, label) in enumerate(options):
+            mark, color = ("❯", _SEL) if i == sel else (" ", _DIM)
+            sys.stdout.write(f"\r\x1b[K  {color}{mark} {label}{_RESET}\r\n")
+        sys.stdout.flush()
+
+    try:
+        tty.setraw(fd)
+        draw(first=True)
+        while True:
+            ch = os.read(fd, 1).decode(errors="ignore")
+            if ch == "\x1b":                        # escape: arrow key or a lone Esc
+                r, _, _ = _select.select([fd], [], [], 0.05)
+                seq = os.read(fd, 2).decode(errors="ignore") if r else ""
+                key = {"[A": "up", "[B": "down", "[C": "right", "[D": "left"}.get(seq, "esc")
+            else:
+                key = ch
+            if key in ("up", "left"):
+                sel = (sel - 1) % n; draw()
+            elif key in ("down", "right"):
+                sel = (sel + 1) % n; draw()
+            elif key in ("\r", "\n"):
+                return options[sel][0]
+            elif key in ("\x03", "esc"):            # Ctrl-C / Esc
+                return None
+            elif len(key) == 1 and key.lower() in keys:
+                return key.lower()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\n"); sys.stdout.flush()
+
+
+def _choose(header_lines: list, options: list):
+    """Ask the user to pick one of `options` = [(key, label), …]. Uses the arrow-key menu
+    on an interactive terminal, else a typed `[y] …` prompt. Returns the chosen key or None."""
+    if sys.stdin.isatty() and sys.stdout.isatty() and not os.environ.get("NO_MENU"):
+        try:
+            return _arrow_menu(header_lines, options)
+        except Exception as e:  # noqa: BLE001 — any terminal issue → typed fallback
+            log.debug("arrow menu unavailable (%s) — typed prompt", e)
+    for line in header_lines:
+        print(line)
+    keys = {k for k, _ in options}
+    prompt = "  " + "   ".join(f"[{k}] {label}" for k, label in options) + "\n  > "
+    try:
+        ans = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if ans[:1] in keys:                              # 'y', 'p', 'a', 'n'
+        return ans[:1]
+    return {"yes": "y", "all": "a", "always": "a", "prefix": "p", "no": "n"}.get(ans)
+
+
 def _approve_command(command: str) -> tuple[bool, str]:
     """Interactive approval prompt for run_command (installed only in 'prompt' mode)."""
     prefix = approval.command_prefix(command)
-    print(f"\n  ⚠  the agent wants to run a shell command:\n      {command}")
-    opts = ["[y] yes, once"]
+    header = ["\n  ⚠  the agent wants to run a shell command:", f"      {_BLUE}{command}{_RESET}"]
+    options = [("y", "yes, once")]
     if prefix:
-        opts.append(f"[p] yes, and don't ask again for '{prefix}' commands")
-    opts += ["[a] yes, all commands this session", "[n] no"]
-    try:
-        ans = input("  " + "   ".join(opts) + "\n  > ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False, "no input — declined"
-    if ans in {"a", "all", "always"}:
+        options.append(("p", f"yes, and don't ask again for '{prefix}' commands"))
+    options += [("a", "yes, all commands this session"), ("n", "no")]
+    choice = _choose(header, options)
+    if choice == "a":
         approval.approve_session()
         return True, "approved (all commands this session)"
-    if prefix and ans in {"p", "prefix"}:
+    if prefix and choice == "p":
         approval.allow_prefix(prefix)
         return True, f"approved (all '{prefix}' commands this session)"
-    if ans in {"y", "yes"}:
+    if choice == "y":
         return True, "approved by user"
     return False, "declined by user"
 
@@ -797,17 +864,15 @@ def _approve_command_voice(command: str) -> tuple[bool, str]:
 def _confirm_action(prompt: str, allow_always: bool = True) -> bool:
     """Text confirmation for an outward action. When allow_always is False the
     'yes to all' option is withheld, so the action is confirmed every time."""
-    print(f"\n  ⚠  {prompt}")
-    opts = "  [y] yes   [n] no" + ("   [a] yes to all this session" if allow_always else "")
-    try:
-        ans = input(opts + "\n  > ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    if allow_always and ans in {"a", "all", "always"}:
+    header = [f"\n  ⚠  {prompt}"]
+    options = [("y", "yes"), ("n", "no")]
+    if allow_always:
+        options.append(("a", "yes to all this session"))
+    choice = _choose(header, options)
+    if allow_always and choice == "a":
         approval.confirm_auto()
         return True
-    return ans in {"y", "yes"}
+    return choice == "y"
 
 
 def _confirm_action_voice(prompt: str, allow_always: bool = True) -> bool:
@@ -1111,7 +1176,14 @@ def _text_loop(messages: list[dict], label: str, face=None, speak: bool = False)
             print("bye.")
             break
         face.set("thinking")
-        reply = process_turn(messages, user_input, printer=_Printer(label))
+        _snapshot = len(messages)            # rollback point if this turn is interrupted
+        try:
+            reply = process_turn(messages, user_input, printer=_Printer(label))
+        except KeyboardInterrupt:
+            del messages[_snapshot:]         # discard the partial turn — keep history clean
+            print(f"\n  {_DIM}⏹ stopped — go ahead.{_RESET}")
+            face.set("idle")
+            continue
         if _voice and reply:
             _speak_reply(_voice, reply, face)
         face.set("idle")
@@ -1266,7 +1338,14 @@ def _voice_loop(messages: list[dict], label: str, face=None) -> None:
         voice.speak_interruptible(random.choice(_THINKING_FILLERS))
 
         face.set("thinking")
-        reply = process_turn(messages, user_input, printer=_Printer(label))
+        _snapshot = len(messages)            # rollback point if this turn is interrupted
+        try:
+            reply = process_turn(messages, user_input, printer=_Printer(label))
+        except KeyboardInterrupt:
+            del messages[_snapshot:]         # discard the partial turn — keep history clean
+            print(f"\n  {_DIM}⏹ stopped.{_RESET}")
+            face.set("listening")
+            continue
         if not reply:
             continue
 
