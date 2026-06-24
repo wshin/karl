@@ -219,7 +219,11 @@ _CREATOR_ANSWERS = (
 _AI_BIRTHPLACE = "Reno, Nevada"
 _CREATOR_BIRTHPLACE = "Daegu, South Korea"
 
-# Age / "when were you born" — Karl has a birthplace (Reno) but no human birth DATE;
+# Karl's birth date — when it was first built. A real, fixed fact (default below,
+# overridable by a creator-set self-fact). Its AGE is computed live from this date.
+_AI_BIRTHDATE = "June 20, 2026"
+
+# Age / "when were you born" — Karl HAS a birth date (Reno, June 20 2026) and an age;
 # answer in the first person (the model otherwise flips pronouns or invents a date).
 _AGE = re.compile(
     r"(?i)("
@@ -228,13 +232,6 @@ _AGE = re.compile(
     r"|\bhow\s+old\s+are\s+you\b"
     r"|\bdo\s+you\s+have\s+(?:a\s+)?(?:birthday|an\s+age)\b"
     r")")
-
-_AGE_ANSWERS = (
-    f"I don't have a birth date the way people do, but I was 'born' in {_AI_BIRTHPLACE}, "
-    "where I was built.",
-    f"No real birthday — I'm software — though you could say I came to life in {_AI_BIRTHPLACE}.",
-    f"I wasn't born on a date, but my origin is {_AI_BIRTHPLACE}.",
-)
 
 # "Where were you born / where are you from" → Karl's birthplace (Reno).
 _BIRTHPLACE_YOU = re.compile(
@@ -275,14 +272,53 @@ def _creator_answer() -> str:
     return random.choice(_CREATOR_ANSWERS)
 
 
+def _parse_birthdate(s: str):
+    """Parse a stored birth date ('June 20, 2026', 'June 20th, 2026', '2026-06-20')."""
+    s = re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", (s or "").strip())   # drop ordinal suffixes
+    for fmt in ("%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _humanize_age(bday: str, today=None):
+    """A natural age string from a birth date — '4 days old', '3 weeks old', '5 months
+    old', '2 years old' — or None if it can't be parsed or is in the future."""
+    d = _parse_birthdate(bday)
+    if not d:
+        return None
+    today = today or datetime.date.today()
+    days = (today - d).days
+    if days < 0:
+        return None
+    if days == 0:
+        return "less than a day old"
+    if days == 1:
+        return "1 day old"
+    if days < 14:
+        return f"{days} days old"
+    if days < 56:
+        return f"{round(days / 7)} weeks old"
+    months = (today.year - d.year) * 12 + (today.month - d.month) - (today.day < d.day)
+    if months < 24:
+        return f"{months} months old"
+    return f"{months // 12} years old"
+
+
 def _age_answer() -> str:
-    # A creator-set birthday overrides the "no birth date" default.
-    bday = self_facts.get("birthday")
-    if bday:
-        return random.choice((f"My birthday is {bday}.",
-                              f"I was born on {bday}.",
-                              f"You set my birthday as {bday}."))
-    return random.choice(_AGE_ANSWERS)
+    # Karl has a real birth date (default _AI_BIRTHDATE; a creator-set fact overrides it),
+    # and reports its age computed live from that date.
+    bday = self_facts.get("birthday") or _AI_BIRTHDATE
+    place = self_facts.get("birthplace") or _AI_BIRTHPLACE
+    age = _humanize_age(bday)
+    if age:
+        return random.choice((
+            f"I was 'born' on {bday} in {place}, so I'm {age}.",
+            f"My birthday is {bday} — that makes me {age} right now.",
+            f"I'm {age}; I came to life on {bday} in {place}."))
+    return random.choice((f"My birthday is {bday}.", f"I was 'born' on {bday}."))
 
 
 def _birthplace_answer() -> str:

@@ -1064,23 +1064,30 @@ def test_voice_rearm_idle_clock():
 
 
 def test_age_birthday_questions_answer_first_person():
-    import main
-    import re as _re
+    import main, datetime
     # birth / age / birthday questions are detected and route to the age answer
     for q in ["when were you born", "when were you made", "how old are you",
               "what's your birthday", "what is your age", "do you have a birthday"]:
         assert main._is_age_question(q), q
         assert main._is_identity_question(q), q       # short-circuits, no model call
         assert not main._is_creator_question(q), q    # not a "who made you" question
-    # answers are first-person, claim no human birthday, and invent no date/year
-    assert len(main._AGE_ANSWERS) >= 2
-    for ans in main._AGE_ANSWERS:
-        assert not _re.search(r"20\d\d", ans), ans    # no fabricated birth year
-        assert "You were born" not in ans             # never the flipped-pronoun bug
-    # process_turn answers a birth question from the age set (not user-as-subject)
+    # Karl has a real, fixed birth date and computes its age live from it
+    assert main._AI_BIRTHDATE == "June 20, 2026"
+    assert main._parse_birthdate("June 20th, 2026") == datetime.date(2026, 6, 20)
+    assert main._parse_birthdate("2026-06-20") == datetime.date(2026, 6, 20)
+    # age buckets (days -> weeks -> months -> years), and a future date yields no age
+    born = "June 20, 2026"
+    assert main._humanize_age(born, datetime.date(2026, 6, 24)) == "4 days old"
+    assert main._humanize_age(born, datetime.date(2026, 7, 18)) == "4 weeks old"
+    assert main._humanize_age(born, datetime.date(2026, 12, 20)) == "6 months old"
+    assert main._humanize_age(born, datetime.date(2029, 6, 20)) == "3 years old"
+    assert main._humanize_age(born, datetime.date(2026, 1, 1)) is None      # future -> none
+    # process_turn answers a birth/age question first-person with the date + a live age,
+    # never flipping the subject onto the user
     msgs = [{"role": "system", "content": "sys"}]
-    reply = main.process_turn(msgs, "when were you born?")
-    assert reply in main._AGE_ANSWERS
+    reply = main.process_turn(msgs, "how old are you?")
+    assert "2026" in reply and "You were born" not in reply
+    assert main._humanize_age(main._AI_BIRTHDATE) in reply
 
 
 def test_birthplace_distinction_ai_vs_creator():
@@ -1103,9 +1110,10 @@ def test_birthplace_distinction_ai_vs_creator():
     assert "Reno" in main.process_turn(msgs, "where were you born?")
     assert main.process_turn(msgs, "where was your creator born?").count("Daegu") == 1
     assert "Reno" not in main.process_turn(msgs, "where was Wontaek born?")
-    # "when were you born" still has no fabricated date but now names the birthplace
+    # "when were you born" gives Karl's real birth date and keeps places straight
+    # (its own Reno, never the creator's Daegu)
     age = main.process_turn(msgs, "when were you born?")
-    assert "Reno" in age
+    assert "2026" in age and "Daegu" not in age
 
 
 def test_gmail_parsing_and_send_gate():
