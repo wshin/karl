@@ -742,11 +742,12 @@ SEND_MESSAGE_SCHEMA = {
     "function": {
         "name": "send_message",
         "description": "Send an email AS THE USER from one of their connected Gmail accounts. "
-                       "Use this ONLY when the user specifies which account / from-address to "
-                       "send from (e.g. 'email her from my gmail', 'send it from "
-                       "wontaek@regenics.com'). If the user does NOT say which account to send "
-                       "from, use send_email instead (Karl sends as itself via SendGrid). "
-                       "Confirms before sending; for new emails and replies.",
+                       "Use this ONLY when the user EXPLICITLY says to send FROM their account "
+                       "('email her from my gmail', 'send it as me', 'from wontaek@regenics.com'). "
+                       "IMPORTANT: a recipient like 'send it TO my gmail' or 'send ME the file' "
+                       "is NOT a from-instruction — that's the destination; for those use "
+                       "send_email (the default, Karl sends as itself via SendGrid). If the user "
+                       "didn't clearly name a FROM account, use send_email. Confirms before sending.",
         "parameters": {
             "type": "object",
             "properties": {
