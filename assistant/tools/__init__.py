@@ -92,6 +92,12 @@ if config.GMAIL_ENABLED:
         "deep_spam_cleanup": gmail_tool.deep_spam_cleanup,
     })
 
+# Outbound email via SendGrid — appears only when SENDGRID_API_KEY + SENDGRID_FROM are set.
+if config.SENDGRID_ENABLED:
+    from . import sendgrid_tool
+    TOOLS += [sendgrid_tool.SEND_EMAIL_SCHEMA]
+    TOOL_FUNCTIONS.update({"send_email": sendgrid_tool.send_email})
+
 # Guard against the registry halves drifting out of sync.
 _schema_names = {t["function"]["name"] for t in TOOLS}
 assert _schema_names == set(TOOL_FUNCTIONS), (

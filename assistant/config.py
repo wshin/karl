@@ -198,6 +198,17 @@ MAX_SEARCH_RESULTS = 5
 # TAVILY_API_KEY is read lazily via require_tavily_key() — Phases 1–2 run without it.
 MAX_FETCH_CHARS = 8000       # truncate fetched pages to protect the context window
 
+# --- Outbound email via SendGrid ---------------------------------------------
+# Lets Karl send email through SendGrid (separate from the per-account Gmail send).
+# Set SENDGRID_API_KEY + SENDGRID_FROM (a verified sender) in .env. The send_email tool
+# appears only when both are set; every send is confirmed first.
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+SENDGRID_FROM = os.environ.get("SENDGRID_FROM", "")
+SENDGRID_FROM_NAME = os.environ.get("SENDGRID_FROM_NAME", os.environ.get("AGENT_NAME", "Karl"))
+SENDGRID_ENABLED = bool(SENDGRID_API_KEY and SENDGRID_FROM)
+SENDGRID_CONFIRM_SENDS = os.environ.get(
+    "SENDGRID_CONFIRM_SENDS", "1").lower() in {"1", "true", "yes"}
+
 # --- History management ------------------------------------------------------
 HISTORY_MAX_MESSAGES = 40    # when history exceeds this, the trim seam kicks in (Phase 1 no-op)
 

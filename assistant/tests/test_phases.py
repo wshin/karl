@@ -1830,3 +1830,55 @@ def test_disconnect_google_account():
         # removing something not connected is a clean no-op message
         assert "don't have a connected account" in accounts.disconnect_google_account("ghost@x.com")
     config.GOOGLE_ACCOUNTS = []
+
+
+def test_sendgrid_send_email():
+    """send_email posts to SendGrid after confirmation, guards bad input, and surfaces
+    SendGrid errors. Network is mocked — no real send."""
+    import types
+    import config, approval
+    from tools import sendgrid_tool
+    with mock.patch.object(config, "SENDGRID_ENABLED", True), \
+            mock.patch.object(config, "SENDGRID_API_KEY", "SG.test"), \
+            mock.patch.object(config, "SENDGRID_FROM", "karl@3dbp.com"), \
+            mock.patch.object(config, "SENDGRID_CONFIRM_SENDS", True):
+        approval.set_confirmer(lambda prompt, allow_always: True)   # user approves
+        captured = {}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            captured["url"], captured["json"], captured["auth"] = url, json, headers["Authorization"]
+            return types.SimpleNamespace(status_code=202, headers={"X-Message-Id": "abc"}, text="")
+
+        with mock.patch("requests.post", fake_post):
+            out = sendgrid_tool.send_email("wontaek@gmail.com", "Hi", "Body", cc="a@b.com")
+        assert "Sent to" in out and "abc" in out
+        assert captured["url"].endswith("/v3/mail/send")
+        assert captured["json"]["from"]["email"] == "karl@3dbp.com"
+        assert captured["json"]["personalizations"][0]["to"] == [{"email": "wontaek@gmail.com"}]
+        assert captured["json"]["personalizations"][0]["cc"] == [{"email": "a@b.com"}]
+        assert captured["auth"] == "Bearer SG.test"
+
+        # declined confirmation -> nothing sent
+        approval.set_confirmer(lambda prompt, allow_always: False)
+        assert "DENIED" in sendgrid_tool.send_email("x@y.com", "s", "b")
+        approval.set_confirmer(lambda prompt, allow_always: True)
+
+        # guardrails: no recipient / no subject
+        assert "ERROR" in sendgrid_tool.send_email("", "s", "b")
+        assert "no subject" in sendgrid_tool.send_email("x@y.com", "", "b")
+
+        # SendGrid rejection (e.g. unverified sender) is surfaced
+        def reject(url, headers=None, json=None, timeout=None):
+            return types.SimpleNamespace(status_code=403, headers={},
+                                         json=lambda: {"errors": [{"message": "sender not verified"}]}, text="")
+        with mock.patch("requests.post", reject):
+            out = sendgrid_tool.send_email("x@y.com", "s", "b")
+        assert "403" in out and "sender not verified" in out
+    approval.reset()
+
+
+def test_sendgrid_disabled_returns_clear_error():
+    import config
+    from tools import sendgrid_tool
+    with mock.patch.object(config, "SENDGRID_ENABLED", False):
+        assert "isn't configured" in sendgrid_tool.send_email("x@y.com", "s", "b")
