@@ -794,23 +794,30 @@ def _arrow_menu(header_lines: list, options: list):
 def _choose(header_lines: list, options: list):
     """Ask the user to pick one of `options` = [(key, label), …]. Uses the arrow-key menu
     on an interactive terminal, else a typed `[y] …` prompt. Returns the chosen key or None."""
-    if sys.stdin.isatty() and sys.stdout.isatty() and not os.environ.get("NO_MENU"):
-        try:
-            return _arrow_menu(header_lines, options)
-        except Exception as e:  # noqa: BLE001 — any terminal issue → typed fallback
-            log.debug("arrow menu unavailable (%s) — typed prompt", e)
-    for line in header_lines:
-        print(line)
-    keys = {k for k, _ in options}
-    prompt = "  " + "   ".join(f"[{k}] {label}" for k, label in options) + "\n  > "
+    spinner = _active_spinner            # pause any working spinner so the prompt is clean
+    if spinner:
+        spinner.pause()
     try:
-        ans = input(prompt).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-    if ans[:1] in keys:                              # 'y', 'p', 'a', 'n'
-        return ans[:1]
-    return {"yes": "y", "all": "a", "always": "a", "prefix": "p", "no": "n"}.get(ans)
+        if sys.stdin.isatty() and sys.stdout.isatty() and not os.environ.get("NO_MENU"):
+            try:
+                return _arrow_menu(header_lines, options)
+            except Exception as e:  # noqa: BLE001 — any terminal issue → typed fallback
+                log.debug("arrow menu unavailable (%s) — typed prompt", e)
+        for line in header_lines:
+            print(line)
+        keys = {k for k, _ in options}
+        prompt = "  " + "   ".join(f"[{k}] {label}" for k, label in options) + "\n  > "
+        try:
+            ans = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if ans[:1] in keys:                              # 'y', 'p', 'a', 'n'
+            return ans[:1]
+        return {"yes": "y", "all": "a", "always": "a", "prefix": "p", "no": "n"}.get(ans)
+    finally:
+        if spinner:
+            spinner.resume()
 
 
 def _approve_command(command: str) -> tuple[bool, str]:
@@ -958,14 +965,99 @@ class _NoFace:
     def stop(self): pass
 
 
+# --- working spinner ---------------------------------------------------------
+# A colorful one-line status ('⠹ Searching the web… (ctrl-c to interrupt)') shown while
+# Karl is thinking or running tools, so it never looks stuck. The label is driven by
+# agent_turn's on_status callback. Stops the instant the answer starts streaming.
+_SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_SPIN_PALETTE = (39, 45, 51, 87, 123, 159, 123, 87, 51, 45)   # cyan→white pulse
+_active_spinner = None        # the spinner currently animating (so prompts can pause it)
+
+
+class _Spinner:
+    """Animated 'working' indicator on its own line. No-op unless stdout is a color TTY."""
+
+    def __init__(self):
+        import threading
+        self._on = _COLOR and sys.stdout.isatty()
+        self._label = "Thinking"
+        self._stop = None
+        self._thread = None
+        self._lock = threading.Lock()
+
+    def _run(self):
+        import itertools, time
+        frames, palette = itertools.cycle(_SPIN_FRAMES), itertools.cycle(_SPIN_PALETTE)
+        while self._stop and not self._stop.is_set():
+            with self._lock:
+                label = self._label
+            sys.stdout.write(
+                f"\r\x1b[K  \033[1;38;5;{next(palette)}m{next(frames)}\033[0m "
+                f"{label}… {_DIM}(ctrl-c to interrupt){_RESET}")
+            sys.stdout.flush()
+            time.sleep(0.09)
+
+    def start(self, label: str = "Thinking") -> None:
+        global _active_spinner
+        self._label = label
+        if not self._on:
+            return
+        import threading
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        _active_spinner = self
+        self._thread.start()
+
+    def status(self, label: str) -> None:
+        with self._lock:
+            self._label = label
+
+    def _clear(self) -> None:
+        if self._on:
+            sys.stdout.write("\r\x1b[K")
+            sys.stdout.flush()
+
+    def pause(self) -> None:
+        """Stop animating (e.g. so an approval prompt is clean); resume() brings it back."""
+        if self._thread:
+            self._stop.set()
+            self._thread.join(timeout=0.3)
+            self._thread = None
+            self._clear()
+
+    def resume(self) -> None:
+        if self._on and not self._thread:
+            self.start(self._label)
+
+    def stop(self) -> None:
+        global _active_spinner
+        if self._thread:
+            self._stop.set()
+            self._thread.join(timeout=0.3)
+            self._thread = None
+        self._clear()
+        if _active_spinner is self:
+            _active_spinner = None
+
+
+class _NoSpinner:
+    """No-op spinner (voice mode / non-interactive)."""
+    def start(self, *_a): pass
+    def status(self, *_a): pass
+    def pause(self): pass
+    def resume(self): pass
+    def stop(self): pass
+
+
 class _Printer:
     """Streams the assistant's reply to the terminal — prose line by line, with fenced
     ```code``` blocks buffered and syntax-highlighted. The label prefix prints lazily on
     the first token (so tool-resolution steps stay silent)."""
 
-    def __init__(self, label: str):
+    def __init__(self, label: str, spinner=None):
         self.label = label
         self.started = False
+        self._spinner = spinner
         self._buf = ""            # incomplete trailing line not yet printed
         self._in_code = False
         self._code: list[str] = []
@@ -973,6 +1065,8 @@ class _Printer:
 
     def write(self, text: str) -> None:
         if not self.started:
+            if self._spinner:
+                self._spinner.stop()           # answer is streaming — clear the spinner
             print(f"{self.label} ▸ ", end="", flush=True)
             self.started = True
         self._buf += text
@@ -1009,7 +1103,8 @@ class _Printer:
             print()
 
 
-def process_turn(messages: list[dict], user_input: str, printer: "_Printer | None" = None) -> str | None:
+def process_turn(messages: list[dict], user_input: str, printer: "_Printer | None" = None,
+                 on_status=None) -> str | None:
     """Run one full turn: recall memories, run the agent (streaming the final
     answer to `printer` if given), persist new facts.
 
@@ -1125,7 +1220,8 @@ def process_turn(messages: list[dict], user_input: str, printer: "_Printer | Non
         messages[base_len]["content"] = preface + "\n\n" + user_input
 
     try:
-        reply = agent_turn(messages, on_token=printer.write if printer else None)
+        reply = agent_turn(messages, on_token=printer.write if printer else None,
+                            on_status=on_status)
     except Exception as e:  # noqa: BLE001 — keep the loop alive on transient errors
         if printer:
             printer.finish()
@@ -1177,13 +1273,19 @@ def _text_loop(messages: list[dict], label: str, face=None, speak: bool = False)
             break
         face.set("thinking")
         _snapshot = len(messages)            # rollback point if this turn is interrupted
+        spinner = _Spinner()
+        spinner.start("Thinking")
         try:
-            reply = process_turn(messages, user_input, printer=_Printer(label))
+            reply = process_turn(messages, user_input,
+                                 printer=_Printer(label, spinner), on_status=spinner.status)
         except KeyboardInterrupt:
+            spinner.stop()
             del messages[_snapshot:]         # discard the partial turn — keep history clean
             print(f"\n  {_DIM}⏹ stopped — go ahead.{_RESET}")
             face.set("idle")
             continue
+        finally:
+            spinner.stop()                   # always clear it (also covers a no-stream reply)
         if _voice and reply:
             _speak_reply(_voice, reply, face)
         face.set("idle")

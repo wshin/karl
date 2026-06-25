@@ -34,6 +34,31 @@ log = logging.getLogger("assistant.agent")
 # sweeps). Override with MAX_AGENT_STEPS.
 MAX_STEPS = config.MAX_AGENT_STEPS
 
+# Friendly present-tense labels for the working spinner, by tool name. Anything not
+# listed falls back to "Working".
+_TOOL_STATUS = {
+    "web_search": "Searching the web", "fetch_url": "Reading a page",
+    "read_url": "Reading a page", "run_command": "Running a command",
+    "write_file": "Writing a file", "read_file": "Reading a file",
+    "edit_file": "Editing a file", "apply_patch": "Editing files",
+    "list_files": "Looking through files", "list_dir": "Looking through files",
+    "list_messages": "Checking email", "read_message": "Reading an email",
+    "send_message": "Sending email", "trash_message": "Cleaning up email",
+    "trash_from_sender": "Cleaning up email", "unsubscribe": "Unsubscribing",
+    "deep_spam_cleanup": "Cleaning up spam", "find_spam_candidates": "Scanning email",
+    "auto_delete_sender": "Cleaning up spam", "keep_sender": "Updating spam settings",
+    "list_events": "Checking your calendar", "create_event": "Updating your calendar",
+    "list_google_accounts": "Checking your accounts", "connect_google_account": "Connecting an account",
+    "set_account_label": "Updating your accounts", "clear_account_label": "Updating your accounts",
+    "save_memory": "Saving to memory", "think": "Thinking it through",
+}
+
+
+def _status_for(calls: list[dict]) -> str:
+    """A single friendly status label for a step's tool call(s)."""
+    names = [c["name"] for c in calls]
+    return _TOOL_STATUS.get(names[0], "Working") if names else "Working"
+
 
 def _normalize_calls(msg) -> list[dict]:
     """Return a uniform [{"id", "name", "args", "error"}] from a model message.
@@ -153,13 +178,20 @@ def _stream_collect(messages, on_token):
     return SimpleNamespace(content="".join(parts), tool_calls=tool_calls), live
 
 
-def agent_turn(messages: list[dict], on_token=None) -> str:
+def agent_turn(messages: list[dict], on_token=None, on_status=None) -> str:
     """Run one full turn, resolving any tool calls. Returns final assistant text.
 
     When on_token is given, the final answer is streamed to it token-by-token;
-    otherwise the call is non-streaming (used by tests).
+    otherwise the call is non-streaming (used by tests). When on_status is given, it's
+    called with a short status label ("Thinking", "Searching the web", …) as the turn
+    progresses, so the CLI can drive a working spinner.
     """
-    for _ in range(MAX_STEPS):
+    def status(label):
+        if on_status:
+            on_status(label)
+
+    for step in range(MAX_STEPS):
+        status("Thinking" if step == 0 else "Working")
         if on_token is None:
             msg = chat(messages, tools=TOOLS).choices[0].message
             displayed = False
@@ -175,6 +207,7 @@ def agent_turn(messages: list[dict], on_token=None) -> str:
         # break the line so it doesn't run into what comes after.
         if displayed and on_token:
             on_token("\n")
+        status(_status_for(calls))           # e.g. "Searching the web", "Running a command"
         messages.append(_assistant_tool_message(calls))
         for c in calls:
             result = c["error"] and f"ERROR: {c['error']}" or _execute(c["name"], c["args"])

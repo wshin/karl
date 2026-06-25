@@ -1424,7 +1424,7 @@ def test_short_reaction_steers_to_last_topic():
 
     # process_turn folds a steer into the turn that pins the model to the last topic
     captured = {}
-    def fake_agent(messages, on_token=None):
+    def fake_agent(messages, on_token=None, on_status=None):
         captured["turn"] = messages[-1]["content"]
         return "Yes, that forecast holds."
     msgs = [{"role": "system", "content": "sys"},
@@ -1459,7 +1459,7 @@ def test_self_facts_override_canned_identity(tmp_path):
         assert main._capture_self_fact("when were you born?") is None
         assert main._capture_self_fact("I was born in Daegu") is None
 
-        def fake_agent(messages, on_token=None):
+        def fake_agent(messages, on_token=None, on_status=None):
             return "x"
         msgs = [{"role": "system", "content": "sys"}]
         with mock.patch.object(main, "agent_turn", fake_agent), \
@@ -1526,7 +1526,7 @@ def test_revision_request_stays_on_previous_answer():
     # end to end: a "too long" follow-up skips memory recall AND steers to the prior
     # answer, so an unrelated memory can't hijack it (the reported bug)
     captured, recalled = {}, {"hit": False}
-    def fake_agent(msgs, on_token=None):
+    def fake_agent(msgs, on_token=None, on_status=None):
         captured["turn"] = msgs[-1]["content"]
         return "one-liner"
     def fake_recall(q):
@@ -1588,7 +1588,7 @@ def test_terse_followup_continues_current_topic():
     # end to end: after a weather answer, "china" skips recall (no stray Reno memory)
     # and is steered to continue the topic (weather in China)
     captured, recalled = {}, {"hit": False}
-    def fake_agent(msgs, on_token=None):
+    def fake_agent(msgs, on_token=None, on_status=None):
         captured["t"] = msgs[-1]["content"]
         return "x"
     def fake_recall(q):
@@ -1761,7 +1761,7 @@ def test_interrupt_thinking_discards_partial_turn():
     msgs = [{"role": "system", "content": "s"},
             {"role": "user", "content": "old"}, {"role": "assistant", "content": "prev"}]
 
-    def boom(messages, user_input, printer=None):
+    def boom(messages, user_input, printer=None, on_status=None):
         messages.append({"role": "user", "content": user_input})   # partial turn
         raise KeyboardInterrupt
 
@@ -1771,3 +1771,32 @@ def test_interrupt_thinking_discards_partial_turn():
         main._text_loop(msgs, "karl")          # returns (didn't crash out) after 'exit'
     assert len(msgs) == 3                        # partial turn discarded
     assert msgs[-1] == {"role": "assistant", "content": "prev"}
+
+
+def test_working_spinner_status_flow():
+    """agent_turn reports friendly status labels, and the printer stops the spinner the
+    moment the answer streams."""
+    import agent, main
+    from types import SimpleNamespace
+    # agent_turn: Thinking -> tool label -> Working (next step) before the final answer
+    steps = [
+        SimpleNamespace(content="", tool_calls=[SimpleNamespace(
+            id="1", function=SimpleNamespace(name="run_command", arguments="{}"))]),
+        SimpleNamespace(content="done.", tool_calls=None),
+    ]
+    seen = []
+    with mock.patch.object(agent, "chat",
+                           lambda messages, tools=None, stream=False: SimpleNamespace(
+                               choices=[SimpleNamespace(message=steps.pop(0))])), \
+            mock.patch.dict(agent.TOOL_FUNCTIONS, {"run_command": lambda **k: "ok"}):
+        agent.agent_turn([{"role": "user", "content": "x"}], on_status=seen.append)
+    assert seen == ["Thinking", "Running a command", "Working"]
+
+    # spinner is a no-op off a TTY, and the printer stops it on the first streamed token
+    sp = main._Spinner()
+    assert sp._on is False                      # tests aren't a color TTY
+    stopped = []
+    sp.stop = lambda: stopped.append(True)
+    p = main._Printer("karl", spinner=sp)
+    p.write("hello")
+    assert stopped == [True]                     # first token cleared the spinner
