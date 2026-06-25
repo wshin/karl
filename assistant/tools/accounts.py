@@ -105,10 +105,22 @@ def connect_google_account(account: str = None) -> str:
         return (f"Connected {email or 'the account'} — it's now included in your email and "
                 "calendar. I'll refer to it by its email; just say so if you'd like to give "
                 "it a label.")
-    # Explicit label requested.
-    if account in google_auth.available_accounts():
-        email = google_auth.account_email(account) or ""
-        return f"'{account}'{f' ({email})' if email else ''} is already connected."
+    # Already connected? Resolve the given label/email/key and short-circuit — NEVER open a
+    # browser for an account we already have (e.g. 'main gmail' is the connected 'main').
+    resolved = google_auth.resolve_account(account)
+    if resolved in google_auth.available_accounts():
+        email = google_auth.account_email(resolved) or account
+        return f"{email} is already connected — no need to reconnect it."
+    # An email address (or anything that isn't a plain new label) → use the auto flow so the
+    # key is derived from whoever actually signs in, not a literal token_<value>.json.
+    if "@" in account:
+        try:
+            _key, email = google_auth.authorize_new()
+        except Exception as e:  # noqa: BLE001
+            return f"Couldn't connect the account: {e}"
+        return (f"Connected {email or 'the account'} — it's now included in your email and "
+                "calendar.")
+    # Otherwise treat `account` as a custom label for a brand-new account.
     try:
         google_auth.authorize(account)  # opens the browser; blocks until the user finishes
     except Exception as e:  # noqa: BLE001
@@ -133,13 +145,15 @@ CONNECT_ACCOUNT_SCHEMA = {
     "type": "function",
     "function": {
         "name": "connect_google_account",
-        "description": "Connect a new Google account by opening the OAuth browser flow. The "
-                       "user signs in with that account and approves. Call this ONLY after "
-                       "confirming the user is ready (it opens a browser they must complete). "
-                       "Do NOT ask the user for a label — just call it with no arguments and "
-                       "the account is identified by its email address. Only pass `account` if "
-                       "the user explicitly volunteers a custom name. If first-time setup is "
-                       "missing it returns the steps to relay.",
+        "description": "Connect a BRAND-NEW Google account by opening the OAuth browser flow. "
+                       "Call this ONLY when the user EXPLICITLY asks to connect / add / link a "
+                       "new account. NEVER call it to send to, read from, or reference an "
+                       "account that's already connected — sending an email to an existing "
+                       "account uses send_email/send_message, NOT this. It opens a browser the "
+                       "user must complete, so only call it once they're ready. Do NOT ask for a "
+                       "label — call it with no arguments and the account is identified by its "
+                       "email; only pass `account` if the user volunteers a custom name. If "
+                       "first-time setup is missing it returns the steps to relay.",
         "parameters": {
             "type": "object",
             "properties": {"account": {"type": "string", "description": "OPTIONAL custom label. Omit unless the user explicitly asks to name the account; by default the account is identified by its email."}},

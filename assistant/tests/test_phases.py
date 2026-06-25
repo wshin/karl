@@ -1940,3 +1940,24 @@ def test_email_recipient_label_resolves_to_address():
             assert "wontaek@gmail.com" in out
             assert captured["json"]["personalizations"][0]["to"] == [{"email": "wontaek@gmail.com"}]
     approval.reset()
+
+
+def test_connect_never_reauthorizes_existing_account():
+    """connect_google_account must NOT open a browser for an account that's already
+    connected — even when referenced by label or email (regression: 'main gmail' opened
+    an OAuth flow instead of being recognized as the connected 'main')."""
+    import config
+    from tools import google_auth as ga, accounts
+    config.GOOGLE_ACCOUNTS = []
+    emails = {"main": "wontaek@gmail.com", "regenics": "wontaek@regenics.com"}
+    labels = {"main": "main gmail"}
+    opened = {"n": 0}
+    with mock.patch("os.path.exists", lambda p: True), \
+            mock.patch.object(ga, "available_accounts", lambda: list(emails)), \
+            mock.patch.object(ga, "account_email", lambda a: emails.get(a)), \
+            mock.patch.object(ga, "load_account_labels", lambda: labels), \
+            mock.patch.object(ga, "authorize", lambda a: opened.__setitem__("n", opened["n"] + 1)), \
+            mock.patch.object(ga, "authorize_new", lambda: opened.__setitem__("n", opened["n"] + 1) or ("k", "z@z.com")):
+        for ref in ["main gmail", "wontaek@gmail.com", "main", "regenics"]:
+            assert "already connected" in accounts.connect_google_account(ref), ref
+        assert opened["n"] == 0          # no OAuth browser flow was ever started
