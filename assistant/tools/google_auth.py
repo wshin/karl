@@ -142,18 +142,25 @@ _email_cache: dict = {}  # label -> email address (network lookup is cached)
 
 
 def account_email(account: str) -> "str | None":
-    """The email address of a connected account (via Gmail getProfile), or None."""
+    """The email address of a connected account (via Gmail getProfile), or None.
+
+    Only SUCCESSFUL lookups are cached — a transient failure (network blip, or a slow
+    token refresh on the first call) is never cached as None, so it doesn't get stuck
+    showing '(address unavailable)' for the rest of the session; the next call retries."""
     key = account or primary_account()
-    if key in _email_cache:
-        return _email_cache[key]
-    try:
-        email = service("gmail", "v1", account).users().getProfile(
-            userId="me").execute().get("emailAddress")
-    except Exception as e:  # noqa: BLE001
-        log.debug("account_email(%s) failed: %s", account, e)
-        email = None
-    _email_cache[key] = email
-    return email
+    cached = _email_cache.get(key)
+    if cached:
+        return cached
+    for attempt in range(2):                 # one retry — getProfile can blip on a refresh
+        try:
+            email = service("gmail", "v1", account).users().getProfile(
+                userId="me").execute().get("emailAddress")
+            if email:
+                _email_cache[key] = email
+                return email
+        except Exception as e:  # noqa: BLE001
+            log.debug("account_email(%s) attempt %d failed: %s", account, attempt + 1, e)
+    return None                              # don't cache the failure — retry next time
 
 
 def account_map() -> dict:

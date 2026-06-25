@@ -1882,3 +1882,27 @@ def test_sendgrid_disabled_returns_clear_error():
     from tools import sendgrid_tool
     with mock.patch.object(config, "SENDGRID_ENABLED", False):
         assert "isn't configured" in sendgrid_tool.send_email("x@y.com", "s", "b")
+
+
+def test_account_email_does_not_cache_transient_failures():
+    """A transient getProfile failure must NOT be cached as None (which would stick as
+    '(address unavailable)' all session) — the next lookup retries and recovers."""
+    from tools import google_auth as ga
+    ga._email_cache.clear()
+    calls = {"n": 0}
+
+    class Svc:
+        def users(self):
+            return mock.Mock(getProfile=lambda userId: mock.Mock(execute=self._exec))
+        def _exec(self):
+            calls["n"] += 1
+            if calls["n"] <= 2:                     # both attempts of the 1st call fail
+                raise RuntimeError("temporary network error")
+            return {"emailAddress": "wontaek@regenics.com"}
+
+    with mock.patch.object(ga, "service", lambda *a, **k: Svc()):
+        assert ga.account_email("regenics") is None            # blip
+        assert "regenics" not in ga._email_cache               # failure NOT cached
+        assert ga.account_email("regenics") == "wontaek@regenics.com"   # recovers
+        assert ga._email_cache.get("regenics") == "wontaek@regenics.com"  # success cached
+    ga._email_cache.clear()
