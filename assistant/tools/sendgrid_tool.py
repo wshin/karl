@@ -15,11 +15,43 @@ log = logging.getLogger("assistant.sendgrid")
 _ENDPOINT = "https://api.sendgrid.com/v3/mail/send"
 
 
+def _build_attachments(attachments):
+    """Read each file path into a SendGrid attachment dict. Returns (att_list, names) or
+    raises ValueError with a readable message on a missing/unreadable file."""
+    import base64
+    import mimetypes
+    import os
+    if isinstance(attachments, str):
+        paths = [p.strip() for p in attachments.split(",")]
+    else:
+        paths = [str(p).strip() for p in (attachments or [])]
+    out, names = [], []
+    for p in paths:
+        if not p:
+            continue
+        if not os.path.isfile(p):
+            raise ValueError(f"attachment not found: {p}")
+        try:
+            with open(p, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            raise ValueError(f"couldn't read attachment {p}: {e}")
+        out.append({
+            "content": base64.b64encode(data).decode(),
+            "filename": os.path.basename(p),
+            "type": mimetypes.guess_type(p)[0] or "application/octet-stream",
+            "disposition": "attachment",
+        })
+        names.append(os.path.basename(p))
+    return out, names
+
+
 def send_email(to: str, subject: str, body: str, cc: str = None,
-               html: bool = False) -> str:
+               html: bool = False, attachments: str = None) -> str:
     """Send an email via SendGrid from the configured sender. Confirms before sending.
 
-    to/cc may be a single address or a comma-separated list. Returns a readable status.
+    to/cc may be a single address or a comma-separated list. `attachments` is an optional
+    comma-separated list of file paths to attach. Returns a readable status.
     """
     if not config.SENDGRID_ENABLED:
         return ("ERROR: SendGrid isn't configured — set SENDGRID_API_KEY and SENDGRID_FROM "
@@ -34,12 +66,17 @@ def send_email(to: str, subject: str, body: str, cc: str = None,
         return "ERROR: no recipient address given."
     if not (subject or "").strip():
         return "ERROR: refusing to send an email with no subject."
+    try:
+        att_list, att_names = _build_attachments(attachments)
+    except ValueError as e:
+        return f"ERROR: {e}"
 
     who = ", ".join(to_list) + (f" (cc {', '.join(cc_list)})" if cc_list else "")
+    extra = f" with {len(att_names)} attachment(s): {', '.join(att_names)}" if att_names else ""
     if not (not config.SENDGRID_CONFIRM_SENDS
             or approval.confirm_action(
                 f"Send an email via SendGrid from {config.SENDGRID_FROM} to {who} — "
-                f"subject '{subject}'?", always_ask=True)):
+                f"subject '{subject}'{extra}?", always_ask=True)):
         return "DENIED: email not sent (you declined)."
 
     personalization = {"to": [{"email": a} for a in to_list]}
@@ -51,6 +88,8 @@ def send_email(to: str, subject: str, body: str, cc: str = None,
         "subject": subject,
         "content": [{"type": "text/html" if html else "text/plain", "value": body or ""}],
     }
+    if att_list:
+        payload["attachments"] = att_list
     try:
         r = requests.post(
             _ENDPOINT,
@@ -62,7 +101,8 @@ def send_email(to: str, subject: str, body: str, cc: str = None,
 
     if r.status_code in (200, 202):
         mid = r.headers.get("X-Message-Id", "")
-        return f"Sent to {who} from {config.SENDGRID_FROM}" + (f" (message id {mid})." if mid else ".")
+        return (f"Sent to {who} from {config.SENDGRID_FROM}{extra}"
+                + (f" (message id {mid})." if mid else "."))
     # Surface SendGrid's error (e.g. unverified sender → 403) so the user can fix it.
     detail = ""
     try:
@@ -92,6 +132,7 @@ SEND_EMAIL_SCHEMA = {
                 "body": {"type": "string", "description": "Email body text."},
                 "cc": {"type": "string", "description": "Optional cc address(es), comma-separated."},
                 "html": {"type": "boolean", "description": "True to send the body as HTML (default plain text)."},
+                "attachments": {"type": "string", "description": "Optional comma-separated file path(s) to attach (e.g. 'apartment_shopping_list.txt')."},
             },
             "required": ["to", "subject", "body"],
         },

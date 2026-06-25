@@ -1245,14 +1245,21 @@ def process_turn(messages: list[dict], user_input: str, printer: "_Printer | Non
             email_steer = (
                 "[EMAIL ROUTING: I named an account to send FROM — use the send_message tool to "
                 "send AS ME from that connected Gmail account. My accounts are ALREADY connected; "
-                "do NOT call connect_google_account.]")
+                "do NOT call connect_google_account. ")
         else:
             email_steer = (
                 "[EMAIL ROUTING: I did NOT name a from-account, so use the send_email tool "
                 "(SendGrid — sends AS YOU from karl@3dbp.com). That is the DEFAULT. Do NOT use "
                 "send_message, and do NOT call connect_google_account — my accounts are ALREADY "
                 "connected. A recipient like 'my main gmail' or 'send me' is the TO address: put "
-                "it in send_email's `to` (a label resolves automatically).]")
+                "it in send_email's `to` (a label resolves automatically). ")
+        # In BOTH cases: if I asked you to send the CONTENT of a file (or to attach one),
+        # actually include it — never send a hollow 'please find attached' placeholder.
+        email_steer += (
+            "If I asked you to send the CONTENT of a file, FIRST read that file (read_file) and "
+            "put its ACTUAL content in the email body — do not write a placeholder like 'please "
+            "find attached'. If I asked you to ATTACH a file, pass its path to the `attachments` "
+            "argument. Either way, the email must actually contain what I asked for.]")
 
     # Fold context into the user turn (transiently — restored to clean after).
     preface = _memory_preface(mems) if mems else ""

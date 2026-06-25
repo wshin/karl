@@ -2004,3 +2004,37 @@ def test_email_send_routing_steer():
     with mock.patch.object(main, "agent_turn", fake_agent), mock.patch.object(main, "recall", lambda q: []):
         main.process_turn([{"role": "system", "content": "s"}], "email her from my regenics")
     assert "send_message" in captured["t"] and "connect_google_account" in captured["t"]
+
+
+def test_sendgrid_attachments_and_content_steer():
+    """send_email can attach real files (base64), guards missing files, and the email
+    steer tells the model to include actual file content, not a placeholder."""
+    import types, tempfile, base64, os as _os
+    import config, main
+    from tools import sendgrid_tool
+    with tempfile.TemporaryDirectory() as d:
+        fp = _os.path.join(d, "list.txt")
+        open(fp, "w").write("couch\ntable")
+        with mock.patch.object(config, "SENDGRID_ENABLED", True), \
+                mock.patch.object(config, "SENDGRID_API_KEY", "SG.t"), \
+                mock.patch.object(config, "SENDGRID_FROM", "karl@3dbp.com"), \
+                mock.patch.object(config, "SENDGRID_CONFIRM_SENDS", False):
+            cap = {}
+            def fake_post(url, headers=None, json=None, timeout=None):
+                cap["json"] = json
+                return types.SimpleNamespace(status_code=202, headers={"X-Message-Id": "m"}, text="")
+            with mock.patch("requests.post", fake_post):
+                out = sendgrid_tool.send_email("a@b.com", "List", "see attached", attachments=fp)
+            att = cap["json"]["attachments"]
+            assert att[0]["filename"] == "list.txt"
+            assert base64.b64decode(att[0]["content"]).decode() == "couch\ntable"
+            assert "attachment(s): list.txt" in out
+            # missing file is a clean error, not a silent drop
+            assert "not found" in sendgrid_tool.send_email("a@b.com", "s", "b", attachments="/no/x.txt")
+    # the steer for "send the content of a file" tells the model to include the real content
+    captured = {}
+    def fake_agent(messages, on_token=None, on_status=None):
+        captured["t"] = messages[-1]["content"]; return "ok"
+    with mock.patch.object(main, "agent_turn", fake_agent), mock.patch.object(main, "recall", lambda q: []):
+        main.process_turn([{"role": "system", "content": "s"}], "send the content of list.txt to my main gmail")
+    assert "read_file" in captured["t"] and "placeholder" in captured["t"]
