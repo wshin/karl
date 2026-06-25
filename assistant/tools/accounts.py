@@ -4,6 +4,7 @@ list what's connected, and connect a new account (runs the OAuth browser flow).
 import logging
 import os
 
+import approval
 import config
 
 log = logging.getLogger("assistant.accounts")
@@ -96,31 +97,28 @@ def connect_google_account(account: str = None) -> str:
             "- Business/Workspace Gmail: your IT admin may block third-party apps — if it "
             "won't connect, ask them to allow it, or have a Workspace admin create the OAuth "
             "app as 'Internal'.")
-    # No label given — connect and identify the account by its email (the common case).
-    if not account:
-        try:
-            _key, email = google_auth.authorize_new()  # browser flow; derives a key from the email
-        except Exception as e:  # noqa: BLE001
-            return f"Couldn't connect the account: {e}"
-        return (f"Connected {email or 'the account'} — it's now included in your email and "
-                "calendar. I'll refer to it by its email; just say so if you'd like to give "
-                "it a label.")
     # Already connected? Resolve the given label/email/key and short-circuit — NEVER open a
     # browser for an account we already have (e.g. 'main gmail' is the connected 'main').
-    resolved = google_auth.resolve_account(account)
-    if resolved in google_auth.available_accounts():
-        email = google_auth.account_email(resolved) or account
-        return f"{email} is already connected — no need to reconnect it."
-    # An email address (or anything that isn't a plain new label) → use the auto flow so the
-    # key is derived from whoever actually signs in, not a literal token_<value>.json.
-    if "@" in account:
+    if account:
+        resolved = google_auth.resolve_account(account)
+        if resolved in google_auth.available_accounts():
+            email = google_auth.account_email(resolved) or account
+            return f"{email} is already connected — no need to reconnect it."
+    # Opening a browser is outward-facing — confirm FIRST, so a stray/confused tool call can
+    # never surprise-launch an OAuth flow. The user must explicitly say yes.
+    target = f" ({account})" if account and "@" not in account else ""
+    if not approval.confirm_action(
+            f"Open a browser to connect a NEW Google account{target}? Sign in with the "
+            "account you want to add.", always_ask=True):
+        return "OK — I won't open a browser. (Sending to an already-connected account doesn't need this.)"
+    # An email or no label → auto flow (key derived from whoever signs in); else a custom label.
+    if not account or "@" in account:
         try:
             _key, email = google_auth.authorize_new()
         except Exception as e:  # noqa: BLE001
             return f"Couldn't connect the account: {e}"
         return (f"Connected {email or 'the account'} — it's now included in your email and "
-                "calendar.")
-    # Otherwise treat `account` as a custom label for a brand-new account.
+                "calendar. I'll refer to it by its email; just say so if you'd like a label.")
     try:
         google_auth.authorize(account)  # opens the browser; blocks until the user finishes
     except Exception as e:  # noqa: BLE001

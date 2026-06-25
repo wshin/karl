@@ -1961,3 +1961,23 @@ def test_connect_never_reauthorizes_existing_account():
         for ref in ["main gmail", "wontaek@gmail.com", "main", "regenics"]:
             assert "already connected" in accounts.connect_google_account(ref), ref
         assert opened["n"] == 0          # no OAuth browser flow was ever started
+
+
+def test_connect_confirms_before_opening_browser():
+    """A connect call (incl. the no-arg path a confused model might pick) must NOT open an
+    OAuth browser without an explicit yes — so it can never surprise-launch during a send."""
+    import config, approval
+    from tools import google_auth as ga, accounts
+    config.GOOGLE_ACCOUNTS = []
+    opened = {"n": 0}
+    with mock.patch("os.path.exists", lambda p: True), \
+            mock.patch.object(ga, "available_accounts", lambda: []), \
+            mock.patch.object(ga, "authorize_new",
+                              lambda: opened.__setitem__("n", opened["n"] + 1) or ("k", "new@x.com")):
+        approval.set_confirmer(lambda prompt, allow_always: False)      # user declines
+        out = accounts.connect_google_account()
+        assert "won't open a browser" in out and opened["n"] == 0       # no OAuth started
+        approval.set_confirmer(lambda prompt, allow_always: True)       # user approves
+        out = accounts.connect_google_account()
+        assert "Connected new@x.com" in out and opened["n"] == 1
+    approval.reset()
