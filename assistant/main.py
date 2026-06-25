@@ -10,6 +10,10 @@ import random
 import re
 import sys
 import time
+try:
+    import readline  # noqa: F401 — importing it gives input() arrow-key editing + history
+except ImportError:  # pragma: no cover — unavailable on some platforms
+    readline = None
 
 import approval
 import config
@@ -32,6 +36,10 @@ _BLUE = "\033[38;5;117m" if _COLOR else ""   # light blue — the user's prompt 
 _DIM = "\033[2m" if _COLOR else ""
 _SEL = "\033[1;38;5;39m" if _COLOR else ""   # bold blue — highlighted menu selection
 _RESET = "\033[0m" if _COLOR else ""
+# The input() prompt: wrap its (zero-width) color in readline's \001…\002 markers so
+# readline measures the prompt correctly while editing/recalling — else arrow keys and
+# long-line redraws misbehave. Only meaningful when readline is actually loaded.
+_PROMPT = ("" if not _COLOR else f"\001{_BLUE}\002" if readline else _BLUE) + "you ▸ "
 
 
 def _highlight(code: str, lang: str) -> str:
@@ -1260,7 +1268,7 @@ def _text_loop(messages: list[dict], label: str, face=None, speak: bool = False)
     while True:
         face.set("listening")
         try:
-            user_input = input(f"{_BLUE}you ▸ ").strip()   # prompt + typed text in light blue
+            user_input = input(_PROMPT).strip()            # prompt + typed text in light blue
         except (EOFError, KeyboardInterrupt):
             print(f"{_RESET}\nbye.")
             break
@@ -1342,7 +1350,7 @@ def _get_voice_input(voice, hands_free: bool) -> str:
         return text
     cmd = input("🎤 [Enter]=talk, 't'=type : ").strip().lower()
     if cmd == "t":
-        return input("you ▸ ").strip()
+        return input(_PROMPT).strip()
     return voice.listen()
 
 
