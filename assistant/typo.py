@@ -18,7 +18,11 @@ import config
 log = logging.getLogger("assistant.typo")
 
 _spell = False  # lazy: False = not yet built, None = unavailable
-_TOKEN = re.compile(r"[A-Za-z']+")
+# A correctable word is a run of letters NOT glued to a digit, '@', '.', '_', '-', '/',
+# ':' or '\' — i.e. a real standalone word, never a fragment of an email address, domain,
+# URL, file path, or alphanumeric identifier. This keeps "wontaek@3dbp.com" and "foo/bar.py"
+# exactly as typed instead of "correcting" 3dbp->3dip or foo->for inside them.
+_TOKEN = re.compile(r"(?<![\w@./:\\-])[A-Za-z']+(?![\w@./:\\-])")
 
 
 def _speller():

@@ -1570,6 +1570,11 @@ def test_autocorrect_fixes_typos_but_protects_names_and_code():
                   "email vendor@regenics.com now", "cd /Users/wontaek/Kara",
                   "I prefer Kotlin", "she doesn't care"]:
             assert typo.correct(s) == s, s
+        # PROTECTED even when an email/domain/path fragment is itself a near-miss typo
+        # (regression: "3dbp"->"3dip", "foo"->"for" inside addresses must NOT happen)
+        for s in ["spam clean up wontaek@3dbp.com", "check 3dbp.com", "foo@bar.io",
+                  "edit service/src/Main.kt", "visit https://3dbp.com/path"]:
+            assert typo.correct(s) == s, s
     # disabled → no-op
     with mock.patch.object(config, "AUTOCORRECT", False):
         assert typo.correct("recieved teh flowers") == "recieved teh flowers"
