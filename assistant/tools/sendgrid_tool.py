@@ -76,9 +76,12 @@ SEND_EMAIL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "send_email",
-        "description": "Send an email via SendGrid from " + (config.SENDGRID_FROM or "the configured sender")
-                       + ". Use this when the user asks to send/email someone via SendGrid (distinct "
-                       "from send_message, which sends from a connected Gmail account). Confirms first.",
+        "description": "Send an email AS KARL via SendGrid from " + (config.SENDGRID_FROM or "the configured sender")
+                       + ". This is the DEFAULT way to send email: whenever the user asks to send / "
+                       "email someone WITHOUT specifying which of their own accounts to send from, "
+                       "use this — Karl sends it as itself. Only if the user names a from-address / "
+                       "their own account ('from my gmail', 'send as me') use send_message instead. "
+                       "Confirms before sending.",
         "parameters": {
             "type": "object",
             "properties": {
