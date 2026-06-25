@@ -56,6 +56,22 @@ def clear_account_label(account: str) -> str:
     return f"Removed the \"{had}\" label — I'll refer to {email or account} by its email now."
 
 
+def disconnect_google_account(account: str) -> str:
+    """Disconnect a connected Google account — delete its saved auth token so Karl stops
+    accessing its email and calendar. `account` may be an email, label, or internal key.
+    The shared credentials.json is untouched; you can reconnect any time."""
+    from . import google_auth
+    key = google_auth.resolve_account(account)
+    if key not in google_auth.available_accounts():
+        return (f"I don't have a connected account matching '{account}'. "
+                "Ask me to list your accounts to see what's connected.")
+    email = google_auth.account_email(key)
+    if google_auth.disconnect(key):
+        return (f"Disconnected {email or account} — Karl no longer accesses it. "
+                "Ask me to connect it again any time.")
+    return f"Couldn't remove {email or account} (no token found)."
+
+
 def connect_google_account(account: str = None) -> str:
     """Connect a Google account by running the OAuth flow (opens a browser). Call this
     only once the user is ready, since it opens a browser they must complete. `account`
@@ -162,6 +178,24 @@ CLEAR_ACCOUNT_LABEL_SCHEMA = {
             "type": "object",
             "properties": {
                 "account": {"type": "string", "description": "Which account — its email address, current label, or internal key."},
+            },
+            "required": ["account"],
+        },
+    },
+}
+
+DISCONNECT_ACCOUNT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "disconnect_google_account",
+        "description": "Disconnect / remove a connected Google account by deleting its saved "
+                       "auth token, so Karl stops accessing its email and calendar. Use when "
+                       "the user asks to remove, disconnect, unlink, or delete an account. "
+                       "Identify it by email, label, or key. It can be reconnected later.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "account": {"type": "string", "description": "Which account to remove — its email address, label, or internal key."},
             },
             "required": ["account"],
         },

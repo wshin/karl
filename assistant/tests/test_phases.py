@@ -1805,3 +1805,28 @@ def test_working_spinner_status_flow():
     p = main._Printer("karl", spinner=sp)
     p.write("hello")
     assert stopped == [True]                     # first token cleared the spinner
+
+
+def test_disconnect_google_account():
+    """Accounts can be removed: disconnect deletes the token (and label), so they leave
+    the connected set and can be reconnected later."""
+    import os as _os, tempfile
+    import config
+    from tools import google_auth as ga, accounts
+    config.GOOGLE_ACCOUNTS = []
+    with tempfile.TemporaryDirectory() as d:
+        config.GOOGLE_TOKEN_PATH = _os.path.join(d, "token.json")
+        config.GOOGLE_LABELS_PATH = _os.path.join(d, "account_labels.json")
+        open(_os.path.join(d, "token_main.json"), "w").write("{}")
+        open(_os.path.join(d, "token_work.json"), "w").write("{}")
+        ga.set_account_label("work", "office")            # give one a label
+        assert set(ga.available_accounts()) == {"main", "work"}
+        # remove by label -> token gone, label cleared, no longer connected
+        msg = accounts.disconnect_google_account("office")
+        assert "Disconnected" in msg
+        assert ga.available_accounts() == ["main"]
+        assert not _os.path.exists(_os.path.join(d, "token_work.json"))
+        assert "work" not in ga.load_account_labels()
+        # removing something not connected is a clean no-op message
+        assert "don't have a connected account" in accounts.disconnect_google_account("ghost@x.com")
+    config.GOOGLE_ACCOUNTS = []

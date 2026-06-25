@@ -61,6 +61,27 @@ def authorize(account: str):
     return _credentials(account, interactive=True)
 
 
+def disconnect(account: "str | None") -> bool:
+    """Remove a connected account: delete its saved token (so Karl stops accessing it),
+    drop its display label, and clear cached clients/emails. `account` may be a key,
+    email, or label. Returns True if a token was actually removed. credentials.json (the
+    shared app) is never touched, so the account can be reconnected later."""
+    key = resolve_account(account) or primary_account()
+    removed = False
+    try:
+        os.unlink(_token_path(key))
+        removed = True
+    except OSError:
+        pass
+    _email_cache.pop(key, None)
+    for k in [k for k in _services if k[2:] == (key,)]:   # cached service clients for it
+        _services.pop(k, None)
+    labels = load_account_labels()
+    if labels.pop(key, None) is not None:
+        _save_account_labels(labels)
+    return removed
+
+
 def _stable_key_from_email(email: str, taken: set) -> str:
     """A filename-safe internal key derived from an email (e.g. wontaek@gmail.com ->
     'wontaek'), made unique against the already-connected keys in `taken`."""

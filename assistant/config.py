@@ -112,10 +112,11 @@ GOOGLE_CREDENTIALS_PATH = os.path.abspath(os.environ.get(
     "GOOGLE_CREDENTIALS_PATH", os.path.join(os.path.dirname(__file__), "..", "credentials.json")))
 GOOGLE_TOKEN_PATH = os.path.abspath(os.environ.get(
     "GOOGLE_TOKEN_PATH", os.path.join(os.path.dirname(__file__), "..", "token.json")))
-# Multiple Google accounts can be connected (e.g. work + personal). The FIRST label
-# keeps the original token.json (no re-auth); each other label gets token_<label>.json
-# beside it. Authorize each once: `python assistant/tools/google_auth.py <label>`.
-GOOGLE_ACCOUNTS = [a.strip() for a in os.environ.get("GOOGLE_ACCOUNTS", "work,personal").split(",") if a.strip()]
+# Connected accounts are now DISCOVERED from their token files (each connect derives a
+# key from the account's email), so this no longer needs preset labels — leave it empty.
+# Set GOOGLE_ACCOUNTS only to pre-name accounts you'll connect; the FIRST is the primary
+# (uses token.json). An empty list avoids phantom "configured but unconnected" entries.
+GOOGLE_ACCOUNTS = [a.strip() for a in os.environ.get("GOOGLE_ACCOUNTS", "").split(",") if a.strip()]
 # Optional user-chosen display labels for connected accounts (e.g. wontaek@gmail.com ->
 # "personal"). Karl refers to an account by its label when set, else by its email. Stored
 # as {internal-account-key: label}; editable via the set/clear-account-label tools.
