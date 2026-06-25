@@ -451,6 +451,29 @@ def _is_terse_followup(text: str) -> bool:
     return all(re.fullmatch(r"[a-z'’-]+", w) for w in words)  # plain words, not code/commands
 
 
+# Email-send routing. qwen often mis-picks between the two send tools (or wrongly tries to
+# connect an account), so detect the intent in code and inject a hard directive. Detection
+# is two-signal: a SEND verb plus an email-ish cue (or the bare word "email").
+_SEND_VERB = re.compile(r"(?i)\b(?:send|forward|shoot|fire off|mail)\b")
+_EMAIL_CUE = re.compile(
+    r"(?i)(@|\bto\s+(?:my|me)\b|\bfrom\s+(?:my|me)\b|\bsend\s+me\b|\bg-?mail\b|\binbox\b)")
+# A FROM signal means send AS THE USER from their Gmail; otherwise default to SendGrid.
+_EMAIL_FROM = re.compile(
+    r"(?i)\b(?:from\s+(?:my\b|the\b|[\w.+-]+@)|as\s+me\b|as\s+myself\b|on\s+my\s+behalf\b|"
+    r"send\s+it\s+as\s+me\b)")
+
+
+def _is_email_send(text: str) -> bool:
+    t = text or ""
+    if re.search(r"(?i)\be-?mail\b", t):                    # explicit "email" / "e-mail"
+        return True
+    return bool(_SEND_VERB.search(t) and _EMAIL_CUE.search(t))
+
+
+def _email_from_specified(text: str) -> bool:
+    return bool(_EMAIL_FROM.search(text or ""))
+
+
 # A request/question, not a personal statement — skip casual fact extraction on these so
 # content like "write a letter that says I love him" isn't saved as a fake preference.
 _REQUEST = re.compile(r"(?i)^\s*(?:can|could|would|will|please|are you|could you|would you|"
@@ -1215,6 +1238,22 @@ def process_turn(messages: list[dict], user_input: str, printer: "_Printer | Non
             "'weather' still means the weather of the last place we named. Only treat it as a "
             "new topic if it clearly can't be a continuation.]")
 
+    # Deterministic email-send routing (qwen mis-picks the tool on its own).
+    email_steer = ""
+    if _is_email_send(user_input):
+        if _email_from_specified(user_input):
+            email_steer = (
+                "[EMAIL ROUTING: I named an account to send FROM — use the send_message tool to "
+                "send AS ME from that connected Gmail account. My accounts are ALREADY connected; "
+                "do NOT call connect_google_account.]")
+        else:
+            email_steer = (
+                "[EMAIL ROUTING: I did NOT name a from-account, so use the send_email tool "
+                "(SendGrid — sends AS YOU from karl@3dbp.com). That is the DEFAULT. Do NOT use "
+                "send_message, and do NOT call connect_google_account — my accounts are ALREADY "
+                "connected. A recipient like 'my main gmail' or 'send me' is the TO address: put "
+                "it in send_email's `to` (a label resolves automatically).]")
+
     # Fold context into the user turn (transiently — restored to clean after).
     preface = _memory_preface(mems) if mems else ""
     if note:
@@ -1223,6 +1262,8 @@ def process_turn(messages: list[dict], user_input: str, printer: "_Printer | Non
         preface += ("\n" if preface else "") + skill_block
     if reaction_steer:
         preface += ("\n" if preface else "") + reaction_steer
+    if email_steer:
+        preface += ("\n" if preface else "") + email_steer
     messages.append({"role": "user", "content": user_input})
     if preface:
         messages[base_len]["content"] = preface + "\n\n" + user_input

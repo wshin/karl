@@ -151,7 +151,8 @@ def account_email(account: str) -> "str | None":
     cached = _email_cache.get(key)
     if cached:
         return cached
-    for attempt in range(2):                 # one retry — getProfile can blip on a refresh
+    rkey = resolve_account(account) or primary_account()
+    for attempt in range(3):                 # retry — getProfile can blip on a token refresh
         try:
             email = service("gmail", "v1", account).users().getProfile(
                 userId="me").execute().get("emailAddress")
@@ -160,6 +161,9 @@ def account_email(account: str) -> "str | None":
                 return email
         except Exception as e:  # noqa: BLE001
             log.debug("account_email(%s) attempt %d failed: %s", account, attempt + 1, e)
+            # Drop the cached client — it may hold stale/expired credentials; the next
+            # attempt rebuilds it fresh (re-reading + refreshing the token).
+            _services.pop(("gmail", "v1", rkey), None)
     return None                              # don't cache the failure — retry next time
 
 

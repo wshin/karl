@@ -1896,7 +1896,7 @@ def test_account_email_does_not_cache_transient_failures():
             return mock.Mock(getProfile=lambda userId: mock.Mock(execute=self._exec))
         def _exec(self):
             calls["n"] += 1
-            if calls["n"] <= 2:                     # both attempts of the 1st call fail
+            if calls["n"] <= 3:                     # all retries of the 1st call fail
                 raise RuntimeError("temporary network error")
             return {"emailAddress": "wontaek@regenics.com"}
 
@@ -1981,3 +1981,26 @@ def test_connect_confirms_before_opening_browser():
         out = accounts.connect_google_account()
         assert "Connected new@x.com" in out and opened["n"] == 1
     approval.reset()
+
+
+def test_email_send_routing_steer():
+    """Email-send intent is detected and steered deterministically: default to SendGrid,
+    switch to Gmail only when a from-account is named, and never try to connect."""
+    import main
+    # detection + from-routing
+    assert main._is_email_send("send the list.txt to my main gmail") and not main._email_from_specified("send the list.txt to my main gmail")
+    assert main._is_email_send("send me the report") and not main._email_from_specified("send me the report")
+    assert main._is_email_send("email her from my gmail") and main._email_from_specified("email her from my gmail")
+    assert not main._is_email_send("what is the weather")
+    assert not main._is_email_send("send the file to disk")        # not an email
+    # end-to-end: the steer is folded into the turn
+    captured = {}
+    def fake_agent(messages, on_token=None, on_status=None):
+        captured["t"] = messages[-1]["content"]; return "ok"
+    with mock.patch.object(main, "agent_turn", fake_agent), mock.patch.object(main, "recall", lambda q: []):
+        main.process_turn([{"role": "system", "content": "s"}], "send list.txt to my main gmail")
+    assert "send_email" in captured["t"] and "SendGrid" in captured["t"]
+    assert "do NOT call connect_google_account" in captured["t"]
+    with mock.patch.object(main, "agent_turn", fake_agent), mock.patch.object(main, "recall", lambda q: []):
+        main.process_turn([{"role": "system", "content": "s"}], "email her from my regenics")
+    assert "send_message" in captured["t"] and "connect_google_account" in captured["t"]
