@@ -25,9 +25,11 @@ def send_email(to: str, subject: str, body: str, cc: str = None,
         return ("ERROR: SendGrid isn't configured — set SENDGRID_API_KEY and SENDGRID_FROM "
                 "(a verified sender) in the .env file.")
     import requests
+    from . import google_auth
 
-    to_list = [a.strip() for a in (to or "").split(",") if a.strip()]
-    cc_list = [a.strip() for a in (cc or "").split(",") if a.strip()]
+    # Let recipients be given as a connected-account label ("main gmail") — resolve to email.
+    to_list = google_auth.resolve_recipients(to)
+    cc_list = google_auth.resolve_recipients(cc) if cc else []
     if not to_list:
         return "ERROR: no recipient address given."
     if not (subject or "").strip():
@@ -85,7 +87,7 @@ SEND_EMAIL_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "to": {"type": "string", "description": "Recipient email address (or comma-separated addresses)."},
+                "to": {"type": "string", "description": "Recipient email address (or comma-separated addresses). A connected-account label like 'main gmail' is also accepted and resolves to that account's email."},
                 "subject": {"type": "string", "description": "Email subject line."},
                 "body": {"type": "string", "description": "Email body text."},
                 "cc": {"type": "string", "description": "Optional cc address(es), comma-separated."},

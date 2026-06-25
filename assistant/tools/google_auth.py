@@ -223,6 +223,28 @@ def account_display(account: "str | None") -> str:
     return load_account_labels().get(key) or account_email(key) or key
 
 
+def resolve_recipients(addresses) -> list:
+    """Normalize email recipients (a comma-separated string or list) to addresses: any
+    item that names one of YOUR connected accounts — by label, key, or partial — becomes
+    that account's email ('main gmail' -> wontaek@gmail.com). Real addresses (containing
+    '@') pass through untouched; anything unresolved is kept as-is."""
+    if isinstance(addresses, str):
+        items = [a.strip() for a in addresses.split(",")]
+    else:
+        items = [str(a).strip() for a in (addresses or [])]
+    out = []
+    for a in items:
+        if not a:
+            continue
+        if "@" in a:
+            out.append(a)
+            continue
+        key = resolve_account(a)
+        email = account_email(key) if key in available_accounts() else None
+        out.append(email or a)
+    return out
+
+
 def resolve_account(value: "str | None") -> "str | None":
     """Map a user-facing account identifier — an internal key, a full email address, OR a
     user-assigned display label (all case-insensitive) — to the internal key used for

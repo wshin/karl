@@ -126,12 +126,17 @@ def send_message(to: str, subject: str, body: str, cc: str = None, account: str 
         svc = _service(acct)
     except Exception as e:  # noqa: BLE001
         return f"ERROR: {e}"
-    if not _confirm(f"Send email from your {acct} account to {to} — subject '{subject}'?"):
+    # Recipients may be given as a connected-account label ("main gmail") — resolve to email.
+    to_addr = ", ".join(google_auth.resolve_recipients(to))
+    cc_addr = ", ".join(google_auth.resolve_recipients(cc)) if cc else ""
+    if not to_addr:
+        return "ERROR: no recipient address given."
+    if not _confirm(f"Send email from your {acct} account to {to_addr} — subject '{subject}'?"):
         return "DENIED: email not sent (you declined)."
     msg = EmailMessage()
-    msg["To"] = to
-    if cc:
-        msg["Cc"] = cc
+    msg["To"] = to_addr
+    if cc_addr:
+        msg["Cc"] = cc_addr
     msg["Subject"] = subject
     msg.set_content(body)
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
@@ -139,7 +144,7 @@ def send_message(to: str, subject: str, body: str, cc: str = None, account: str 
         sent = svc.users().messages().send(userId="me", body={"raw": raw}).execute()
     except Exception as e:  # noqa: BLE001
         return f"ERROR: {e}"
-    return f"Sent from {acct} to {to} — message id {sent.get('id')}"
+    return f"Sent from {acct} to {to_addr} — message id {sent.get('id')}"
 
 
 def trash_message(message_id: str, account: str = None) -> str:
@@ -745,7 +750,7 @@ SEND_MESSAGE_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "to": {"type": "string", "description": "Recipient email address."},
+                "to": {"type": "string", "description": "Recipient email address. A connected-account label like 'main gmail' is also accepted and resolves to that account's email."},
                 "subject": {"type": "string", "description": "Subject line."},
                 "body": {"type": "string", "description": "Plain-text email body."},
                 "cc": {"type": "string", "description": "CC address(es), optional."},

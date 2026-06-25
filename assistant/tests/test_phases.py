@@ -1906,3 +1906,37 @@ def test_account_email_does_not_cache_transient_failures():
         assert ga.account_email("regenics") == "wontaek@regenics.com"   # recovers
         assert ga._email_cache.get("regenics") == "wontaek@regenics.com"  # success cached
     ga._email_cache.clear()
+
+
+def test_email_recipient_label_resolves_to_address():
+    """Sending 'to' a connected-account label resolves to that account's email, instead
+    of passing the label to the mail provider as a bogus address."""
+    import types
+    import config, approval
+    from tools import google_auth as ga, sendgrid_tool
+    config.GOOGLE_ACCOUNTS = []
+    emails = {"main": "wontaek@gmail.com", "regenics": "wontaek@regenics.com"}
+    labels = {"main": "main gmail", "regenics": "regenics"}
+    with mock.patch.object(ga, "available_accounts", lambda: list(emails)), \
+            mock.patch.object(ga, "account_email", lambda a: emails.get(a)), \
+            mock.patch.object(ga, "load_account_labels", lambda: labels):
+        # the resolver itself
+        assert ga.resolve_recipients("main gmail") == ["wontaek@gmail.com"]
+        assert ga.resolve_recipients("a@b.com, regenics") == ["a@b.com", "wontaek@regenics.com"]
+        assert ga.resolve_recipients("nobody@x.com") == ["nobody@x.com"]
+        # end-to-end: send_email to a label puts the real address in the payload
+        with mock.patch.object(config, "SENDGRID_ENABLED", True), \
+                mock.patch.object(config, "SENDGRID_API_KEY", "SG.t"), \
+                mock.patch.object(config, "SENDGRID_FROM", "karl@3dbp.com"), \
+                mock.patch.object(config, "SENDGRID_CONFIRM_SENDS", False):
+            captured = {}
+
+            def fake_post(url, headers=None, json=None, timeout=None):
+                captured["json"] = json
+                return types.SimpleNamespace(status_code=202, headers={"X-Message-Id": "m"}, text="")
+
+            with mock.patch("requests.post", fake_post):
+                out = sendgrid_tool.send_email("main gmail", "List", "body")
+            assert "wontaek@gmail.com" in out
+            assert captured["json"]["personalizations"][0]["to"] == [{"email": "wontaek@gmail.com"}]
+    approval.reset()
