@@ -2038,3 +2038,32 @@ def test_sendgrid_attachments_and_content_steer():
     with mock.patch.object(main, "agent_turn", fake_agent), mock.patch.object(main, "recall", lambda q: []):
         main.process_turn([{"role": "system", "content": "s"}], "send the content of list.txt to my main gmail")
     assert "read_file" in captured["t"] and "placeholder" in captured["t"]
+
+
+def test_named_lists_manager():
+    """Create/add/remove/show/list/rename/delete named lists; each maps to its own file,
+    names match case-insensitively, items dedup, and metadata tracks counts + dates."""
+    import tempfile, os as _os, importlib
+    import config
+    config.LISTS_DIR = tempfile.mkdtemp()
+    from tools import lists_tool as L
+    importlib.reload(L)
+    assert "Created the list 'Groceries'" in L.create_list("Groceries", "milk, eggs")
+    # add by a differently-cased name resolves to the same list; dupes are skipped
+    out = L.add_to_list("groceries", "bread\neggs")
+    assert "Added 1 item" in out and "1 already on it" in out
+    assert L.show_list("GROCERIES").count("\n") == 3            # header + 3 items
+    # create a second list, then list all (newest-updated first), with dates
+    L.create_list("Packing")
+    allout = L.list_lists()
+    assert "You have 2 list(s)" in allout and "Groceries" in allout and "Packing" in allout
+    assert "item(s)" in allout and "created" in allout and "updated" in allout
+    # remove, rename, delete
+    assert "Removed 1" in L.remove_from_list("groceries", "milk")
+    assert "Renamed" in L.rename_list("Groceries", "Weekly Groceries")
+    assert _os.path.exists(_os.path.join(config.LISTS_DIR, "weekly-groceries.json"))
+    assert not _os.path.exists(_os.path.join(config.LISTS_DIR, "groceries.json"))
+    assert "Deleted the list 'Packing'" in L.delete_list("packing")
+    assert "1 list(s)" in L.list_lists()
+    # unknown list is a clean message, not a crash
+    assert "No list called" in L.show_list("nope")

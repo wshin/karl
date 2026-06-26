@@ -56,6 +56,11 @@ AUTOCORRECT_KEEP = ({"ollama", "qwen", "fintech", "tavily", "piper", "whisper", 
 SELF_FACTS_PATH = os.path.abspath(os.environ.get(
     "SELF_FACTS_PATH", os.path.join(os.path.dirname(__file__), "..", "karl_self.json")))
 
+# Named lists (groceries, todos, …) the user can create and edit. Each list is one JSON
+# file in this directory; the list's name maps to a slugified filename. Gitignored.
+LISTS_DIR = os.path.abspath(os.environ.get(
+    "LISTS_DIR", os.path.join(os.path.dirname(__file__), "..", "karl_lists")))
+
 # --- Subagent models (model routing) -----------------------------------------
 # The main loop uses CHAT_MODEL. Cheap helper jobs (spoken summaries, rewrites)
 # route to a small fast model; genuinely hard planning can be delegated to a

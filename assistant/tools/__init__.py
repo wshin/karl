@@ -7,7 +7,7 @@ Adding a capability = add one entry to each. agent_turn() never changes.
 """
 import config
 
-from . import calc_tool, coding, memory_tool, search, time_tool
+from . import calc_tool, coding, lists_tool, memory_tool, search, time_tool
 
 TOOLS = [
     time_tool.SCHEMA,
@@ -18,6 +18,7 @@ TOOLS = [
     coding.RUN_COMMAND_SCHEMA,
     search.WEB_SEARCH_SCHEMA,
     search.FETCH_URL_SCHEMA,
+    *lists_tool.LIST_SCHEMAS,        # named-list manager (create/add/remove/show/list)
 ]
 
 TOOL_FUNCTIONS = {
@@ -29,6 +30,7 @@ TOOL_FUNCTIONS = {
     "run_command": coding.run_command,
     "web_search": search.web_search,
     "fetch_url": search.fetch_url,
+    **lists_tool.LIST_FUNCTIONS,
 }
 
 # Memory writes are code-driven by default; only expose save_memory to the model
